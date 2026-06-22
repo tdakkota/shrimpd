@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -81,6 +83,179 @@ func TestDaemonSmoke(t *testing.T) {
 		{Timestamp: 1, Data: "foo"},
 		{Timestamp: 2, Data: "bar"},
 	}, got.Data)
+}
+
+func TestDaemonSmokeOTLP(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	etcdEndpoint := startEtcd(ctx, t)
+	dataDir := t.TempDir()
+	must.NoError(os.MkdirAll(filepath.Join(dataDir, "parts"), 0o755))
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{etcdEndpoint},
+		DialTimeout: 5 * time.Second,
+	})
+	must.NoError(err)
+	defer func() {
+		must.NoError(cli.Close())
+	}()
+	waitEtcd(ctx, t, cli)
+
+	wal, err := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	must.NoError(err)
+	defer func() {
+		must.NoError(wal.Close())
+	}()
+
+	addr := freeLocalAddr(t)
+	lsm, err := shrimpd.NewLSM("node1", addr, dataDir, wal, shrimpd.NewRegistry(cli, "node1"))
+	must.NoError(err)
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	eg, runCtx := errgroup.WithContext(runCtx)
+	eg.Go(func() error { return lsm.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	defer func() {
+		stop()
+		err := eg.Wait()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			require.NoError(t, err)
+		}
+	}()
+
+	baseURL := "http://" + addr
+	waitHTTP(ctx, t, baseURL+"/parts")
+
+	// Test OTLP JSON ingestion
+	t.Run("OTLP_JSON", func(t *testing.T) {
+		otlpJSON := `{
+		"resourceLogs": [{
+			"resource": {
+				"attributes": [{
+					"key": "service.name",
+					"value": {"stringValue": "test-service"}
+				}]
+			},
+			"scopeLogs": [{
+				"scope": {
+					"name": "test-scope"
+				},
+				"logRecords": [{
+					"timeUnixNano": "1719080000000000000",
+					"severityText": "INFO",
+					"body": {"stringValue": "hello from OTLP JSON"}
+				}]
+			}]
+		}]
+	}`
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/ingest/otlp", bytes.NewReader([]byte(otlpJSON)))
+		must.NoError(err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		must.NoError(err)
+		must.Equal(http.StatusOK, resp.StatusCode)
+		respBody, err := io.ReadAll(resp.Body)
+		must.NoError(err)
+		resp.Body.Close()
+		must.Equal(`{"partialSuccess":{}}`, string(respBody))
+
+		// Verify we can read it back
+		var gotOTLP shrimpd.Block
+		getJSON(ctx, t, baseURL+"/read?from=1719080000000000000&to=1719080000000000000", &gotOTLP)
+		must.Len(gotOTLP.Data, 1)
+		must.Equal(int64(1719080000000000000), gotOTLP.Data[0].Timestamp)
+
+		// Unmarshal Data to verify resource, scope, and record are present
+		var entryObj struct {
+			Resource map[string]any `json:"resource"`
+			Scope    struct {
+				Name string `json:"name"`
+			} `json:"scope"`
+			Body         any    `json:"body"`
+			SeverityText string `json:"severity_text"`
+		}
+		must.NoError(json.Unmarshal([]byte(gotOTLP.Data[0].Data), &entryObj))
+		must.NotEmpty(entryObj.Resource)
+		must.Equal("test-service", entryObj.Resource["service.name"])
+		must.Equal("test-scope", entryObj.Scope.Name)
+		must.Equal("hello from OTLP JSON", entryObj.Body)
+
+		// Simple term queries exercise tokenization + token index pruning.
+		var qHello shrimpd.Block
+		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=hello", &qHello)
+		must.Len(qHello.Data, 1)
+
+		var qOTLP shrimpd.Block
+		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=otlp", &qOTLP)
+		must.Len(qOTLP.Data, 1)
+
+		var qMiss shrimpd.Block
+		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=nonexistent", &qMiss)
+		must.Len(qMiss.Data, 0)
+	})
+	t.Run("OTLP_Proto", func(t *testing.T) {
+		// Test OTLP Protobuf ingestion
+		logsData := plog.NewLogs()
+		rl := logsData.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", "test-service-proto")
+		sl := rl.ScopeLogs().AppendEmpty()
+		sl.Scope().SetName("test-scope-proto")
+		record := sl.LogRecords().AppendEmpty()
+		record.SetTimestamp(1719080000000000001)
+		record.SetSeverityText("WARN")
+		record.Body().SetStr("hello from OTLP Proto")
+
+		pbBytes, err := (&plog.ProtoMarshaler{}).MarshalLogs(logsData)
+		must.NoError(err)
+
+		reqPB, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/logs", bytes.NewReader(pbBytes))
+		must.NoError(err)
+		reqPB.Header.Set("Content-Type", "application/x-protobuf")
+		respPB, err := http.DefaultClient.Do(reqPB)
+		must.NoError(err)
+		must.Equal(http.StatusOK, respPB.StatusCode)
+		respPBBody, err := io.ReadAll(respPB.Body)
+		must.NoError(err)
+		respPB.Body.Close()
+		must.Len(respPBBody, 0) // expect empty body for protobuf response
+
+		// Verify we can read it back
+		var gotOTLPPB shrimpd.Block
+		getJSON(ctx, t, baseURL+"/read?from=1719080000000000001&to=1719080000000000001", &gotOTLPPB)
+		must.Len(gotOTLPPB.Data, 1)
+		must.Equal(int64(1719080000000000001), gotOTLPPB.Data[0].Timestamp)
+
+		var entryObjPB struct {
+			Resource map[string]any `json:"resource"`
+			Scope    struct {
+				Name string `json:"name"`
+			} `json:"scope"`
+			Body         any    `json:"body"`
+			SeverityText string `json:"severity_text"`
+		}
+		must.NoError(json.Unmarshal([]byte(gotOTLPPB.Data[0].Data), &entryObjPB))
+		must.NotEmpty(entryObjPB.Resource)
+		must.Equal("test-service-proto", entryObjPB.Resource["service.name"])
+		must.Equal("test-scope-proto", entryObjPB.Scope.Name)
+		must.Equal("hello from OTLP Proto", entryObjPB.Body)
+
+		// Term queries on protobuf-ingested record.
+		var qProto shrimpd.Block
+		getJSON(ctx, t, baseURL+"/query?from=1719080000000000001&to=1719080000000000001&term=proto", &qProto)
+		must.Len(qProto.Data, 1)
+
+		var qProtoMiss shrimpd.Block
+		getJSON(ctx, t, baseURL+"/query?from=1719080000000000001&to=1719080000000000001&term=xyz", &qProtoMiss)
+		must.Len(qProtoMiss.Data, 0)
+	})
 }
 
 func startEtcd(ctx context.Context, t *testing.T) string {

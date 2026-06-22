@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -168,6 +169,19 @@ func (l *LSM) startup(ctx context.Context) error {
 	if snap.LogIndex > 0 {
 		if err := l.reg.SetQueuePointer(ctx, snap.LogIndex); err != nil {
 			return fmt.Errorf("set pointer: %w", err)
+		}
+	}
+
+	// Repair missing local sidecars (L1 sparse index).
+	for _, p := range l.parts {
+		if _, err := readSidecar(l.sidecarPath(p.ID)); os.IsNotExist(err) {
+			if b, err := l.readLocalPart(p.ID); err == nil {
+				if err := writeSidecar(l.sidecarPath(p.ID), buildSparse(b.Data, 32)); err != nil {
+					slog.WarnContext(ctx, "repair sidecar failed", "id", p.ID, "error", err)
+				}
+			} else {
+				slog.WarnContext(ctx, "repair sidecar: read part failed", "id", p.ID, "error", err)
+			}
 		}
 	}
 
@@ -381,6 +395,13 @@ func (l *LSM) flush(ctx context.Context) error {
 		return fmt.Errorf("write block: %w", err)
 	}
 
+	sparse := buildSparse(entries, 32)
+	if err := writeSidecar(l.sidecarPath(id), sparse); err != nil {
+		_ = os.Remove(path)
+		l.mem.Write(entries)
+		return fmt.Errorf("write sidecar: %w", err)
+	}
+
 	meta := PartMeta{
 		ID:           id,
 		NodeID:       l.nodeID,
@@ -389,10 +410,12 @@ func (l *LSM) flush(ctx context.Context) error {
 		MaxTimestamp: entries[len(entries)-1].Timestamp,
 		Count:        len(entries),
 		Addr:         l.addr,
+		Tokens:       buildTokenSet(entries),
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
+		_ = os.Remove(l.sidecarPath(id))
 		l.mem.Write(entries)
 		return fmt.Errorf("write meta: %w", err)
 	}
@@ -400,6 +423,7 @@ func (l *LSM) flush(ctx context.Context) error {
 	if _, err := l.reg.AppendLog(ctx, OpPut, meta, nil); err != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(metaPath)
+		_ = os.Remove(l.sidecarPath(id))
 		l.mem.Write(entries)
 		return fmt.Errorf("append log: %w", err)
 	}
@@ -477,6 +501,12 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		return err
 	}
 
+	sparse := buildSparse(merged, 32)
+	if err := writeSidecar(l.sidecarPath(id), sparse); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("write sidecar: %w", err)
+	}
+
 	meta := PartMeta{
 		ID:           id,
 		NodeID:       l.nodeID,
@@ -485,10 +515,12 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		MaxTimestamp: merged[len(merged)-1].Timestamp,
 		Count:        len(merged),
 		Addr:         l.addr,
+		Tokens:       buildTokenSet(merged),
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
+		_ = os.Remove(l.sidecarPath(id))
 		return fmt.Errorf("write meta: %w", err)
 	}
 
@@ -497,6 +529,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	if _, err := l.reg.AppendLog(ctx, OpMerge, meta, oldIDs); err != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(metaPath)
+		_ = os.Remove(l.sidecarPath(id))
 		return fmt.Errorf("append log: %w", err)
 	}
 
@@ -528,7 +561,8 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 }
 
 // Query returns all entries in [from, to] across all nodes by reading locally replicated parts.
-func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
+// Optional term enables L2 (token) and L1 (sparse) pruning.
+func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, error) {
 	l.mu.RLock()
 	allParts := make([]PartMeta, len(l.parts))
 	copy(allParts, l.parts)
@@ -539,13 +573,26 @@ func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
 		if !meta.overlaps(from, to) {
 			continue
 		}
+		if term != "" && !hasToken(meta.Tokens, term) {
+			continue
+		}
+
 		block, err := l.readLocalPart(meta.ID)
 		if err != nil {
 			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
 			continue
 		}
-		for _, e := range block.Data {
-			if e.Timestamp >= from && e.Timestamp <= to {
+		sparse, _ := readSidecar(l.sidecarPath(meta.ID))
+		lo, hi := sparseRange(sparse, from, to)
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(block.Data) {
+			hi = len(block.Data)
+		}
+		for _, e := range block.Data[lo:hi] {
+			if e.Timestamp >= from && e.Timestamp <= to &&
+				(term == "" || strings.Contains(strings.ToLower(e.Data), strings.ToLower(term))) {
 				result = append(result, e)
 			}
 		}
@@ -553,7 +600,8 @@ func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
 
 	// Include memtable (not yet flushed to any part).
 	for _, e := range l.mem.All() {
-		if e.Timestamp >= from && e.Timestamp <= to {
+		if e.Timestamp >= from && e.Timestamp <= to &&
+			(term == "" || strings.Contains(strings.ToLower(e.Data), strings.ToLower(term))) {
 			result = append(result, e)
 		}
 	}
@@ -591,6 +639,10 @@ func (l *LSM) partPath(id string) string {
 
 func (l *LSM) partMetaPath(id string) string {
 	return filepath.Join(l.dataDir, "parts", id+".meta")
+}
+
+func (l *LSM) sidecarPath(id string) string {
+	return filepath.Join(l.dataDir, "parts", id+".sparse.json")
 }
 
 func (l *LSM) readLocalPart(id string) (Block, error) {
@@ -713,12 +765,17 @@ func (l *LSM) runGC(ctx context.Context) error {
 		}
 
 		name := f.Name()
-		ext := filepath.Ext(name)
-		if ext != ".meta" && ext != ".json" {
-			continue
+		var id string
+		switch {
+		case strings.HasSuffix(name, ".sparse.json"):
+			id = strings.TrimSuffix(name, ".sparse.json")
+		default:
+			ext := filepath.Ext(name)
+			if ext != ".meta" && ext != ".json" {
+				continue
+			}
+			id = name[:len(name)-len(ext)]
 		}
-
-		id := name[:len(name)-len(ext)]
 		if _, ok := active[id]; !ok {
 			info, err := f.Info()
 			if err != nil {
