@@ -146,6 +146,7 @@ func (l *LSM) flush(ctx context.Context) error {
 
 	id := newPartID(l.nodeID)
 	path := l.partPath(id)
+	slog.DebugContext(ctx, "creating new part", "id", id, "count", len(entries))
 	if err := writeBlock(path, Block{Data: entries}); err != nil {
 		l.mem.Write(entries) // restore on failure so next flush retries
 		return fmt.Errorf("write block: %w", err)
@@ -196,6 +197,12 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	if !force && len(l0) < compactTrigger {
 		return nil
 	}
+	if len(l0) == 0 {
+		if force {
+			slog.DebugContext(ctx, "compaction skipped: no L0 parts to compact")
+		}
+		return nil
+	}
 
 	var merged []Entry
 	for _, meta := range l0 {
@@ -206,6 +213,9 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		merged = append(merged, b.Data...)
 	}
 	if len(merged) == 0 {
+		if force {
+			slog.DebugContext(ctx, "compaction skipped: no data in L0 parts")
+		}
 		return nil
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].Timestamp < merged[j].Timestamp })
@@ -228,6 +238,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	for i, p := range l0 {
 		oldIDs[i] = p.ID
 	}
+	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "count", len(merged))
 	if err := l.reg.SwapParts(ctx, meta, oldIDs); err != nil {
 		if removeErr := os.Remove(l.partPath(id)); removeErr != nil && !os.IsNotExist(removeErr) {
 			slog.WarnContext(ctx, "remove uncommitted compacted part failed", "id", id, "error", removeErr)

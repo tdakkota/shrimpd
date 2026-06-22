@@ -18,6 +18,7 @@ secret.yml
 secret.yaml
 
 /shrimpd
+/nodes
 
 # goreleaser
 dist

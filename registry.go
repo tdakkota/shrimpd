@@ -57,7 +57,9 @@ func (r *Registry) RegisterNode(ctx context.Context, addr string) error {
 	}
 	go func() {
 		for range ch {
-			slog.DebugContext(ctx, "etcd lease keepalive", "node_id", r.nodeID)
+		}
+		if ctx.Err() == nil {
+			slog.ErrorContext(ctx, "etcd lease keepalive failed", "node_id", r.nodeID)
 		}
 	}()
 	slog.InfoContext(ctx, "registered node", "node_id", r.nodeID, "addr", addr, "lease", lease.ID)

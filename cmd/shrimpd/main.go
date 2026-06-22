@@ -56,6 +56,8 @@ func main() {
 	)
 	flag.Parse()
 
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
 	if err := os.MkdirAll(*dataDir+"/parts", 0o750); err != nil {
 		slog.Error("create data directory", "error", err)
 		os.Exit(1)
