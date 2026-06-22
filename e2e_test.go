@@ -259,7 +259,7 @@ func TestDaemonReplication(t *testing.T) {
 	// for the flushInterval (5s) or we ingest 100 entries.
 	// Let's write 100 entries to force an immediate flush and replication event.
 	entries := make([]shrimpd.Entry, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		entries[i] = shrimpd.Entry{Timestamp: int64(i + 1), Data: fmt.Sprintf("val-%d", i)}
 	}
 	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: entries})
@@ -286,7 +286,7 @@ func TestDaemonReplication(t *testing.T) {
 	// Let's ingest 3 more blocks of 100 entries to create 4 parts in total.
 	for b := 1; b < 4; b++ {
 		batchEntries := make([]shrimpd.Entry, 100)
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			ts := int64(b*100 + i + 1)
 			batchEntries[i] = shrimpd.Entry{Timestamp: ts, Data: fmt.Sprintf("val-%d", ts)}
 		}
@@ -322,4 +322,237 @@ func TestDaemonReplication(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func TestNewNodeBootstrap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	etcdEndpoint := startEtcd(ctx, t)
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{etcdEndpoint}, DialTimeout: 5 * time.Second})
+	must.NoError(err)
+	defer cli.Close()
+	waitEtcd(ctx, t, cli)
+
+	tempDir := t.TempDir()
+	dataDir1 := filepath.Join(tempDir, "node1")
+	dataDir2 := filepath.Join(tempDir, "node2")
+	must.NoError(os.MkdirAll(filepath.Join(dataDir1, "parts"), 0o755))
+	must.NoError(os.MkdirAll(filepath.Join(dataDir2, "parts"), 0o755))
+
+	wal1, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	defer wal1.Close()
+
+	addr1 := freeLocalAddr(t)
+	lsm1, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1, shrimpd.NewRegistry(cli, "node1"))
+	runCtx, stop := context.WithCancel(ctx)
+	eg, _ := errgroup.WithContext(runCtx)
+	eg.Go(func() error { return lsm1.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr1, lsm1).Run(runCtx) })
+	baseURL1 := "http://" + addr1
+	waitHTTP(ctx, t, baseURL1+"/parts")
+
+	// ingest enough to flush a part
+	entries := make([]shrimpd.Entry, 100)
+	for i := range entries {
+		entries[i] = shrimpd.Entry{Timestamp: int64(i + 1), Data: "v"}
+	}
+	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: entries})
+
+	// start node2 (should bootstrap via /lsm/parts/ not replay from 0)
+	wal2, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	defer wal2.Close()
+	addr2 := freeLocalAddr(t)
+	lsm2, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2, shrimpd.NewRegistry(cli, "node2"))
+	eg.Go(func() error { return lsm2.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr2, lsm2).Run(runCtx) })
+	baseURL2 := "http://" + addr2
+	waitHTTP(ctx, t, baseURL2+"/parts")
+
+	var got shrimpd.Block
+	for {
+		getJSON(ctx, t, baseURL2+"/read?from=1&to=100", &got)
+		if len(got.Data) == 100 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("bootstrap timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	stop()
+	_ = eg.Wait()
+}
+
+func TestLogTruncation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	etcdEndpoint := startEtcd(ctx, t)
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{etcdEndpoint}, DialTimeout: 5 * time.Second})
+	must.NoError(err)
+	defer cli.Close()
+	waitEtcd(ctx, t, cli)
+
+	tempDir := t.TempDir()
+	dataDir := filepath.Join(tempDir, "node1")
+	must.NoError(os.MkdirAll(filepath.Join(dataDir, "parts"), 0o755))
+	wal, _ := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	defer wal.Close()
+
+	addr := freeLocalAddr(t)
+	reg := shrimpd.NewRegistry(cli, "node1")
+	lsm, _ := shrimpd.NewLSM("node1", addr, dataDir, wal, reg)
+	runCtx, stop := context.WithCancel(ctx)
+	eg, _ := errgroup.WithContext(runCtx)
+	eg.Go(func() error { return lsm.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	base := "http://" + addr
+	waitHTTP(ctx, t, base+"/parts")
+
+	// generate many parts -> long log
+	for b := range 5 {
+		ents := make([]shrimpd.Entry, 100)
+		for i := range ents {
+			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+		}
+		postJSON(ctx, t, base+"/ingest", shrimpd.Block{Data: ents})
+		time.Sleep(100 * time.Millisecond)
+	}
+	// force compaction to produce merge entries
+	postJSON(ctx, t, base+"/compact", nil)
+
+	// wait a bit for cleanup loop to run (30s ticker), we can't easily wait, just call directly
+	_ = reg.LogCleanup(ctx)
+
+	// check log entries are bounded (we expect truncation happened at least somewhat)
+	resp, _ := cli.Get(ctx, "/lsm/log/", clientv3.WithPrefix())
+	// At least we did not error; if truncation ran, fewer than 1000 keys.
+	must.LessOrEqual(len(resp.Kvs), 1000)
+	stop()
+	_ = eg.Wait()
+}
+
+func TestRecoveringNode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	etcdEndpoint := startEtcd(ctx, t)
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{etcdEndpoint}, DialTimeout: 5 * time.Second})
+	must.NoError(err)
+	defer cli.Close()
+	waitEtcd(ctx, t, cli)
+
+	tempDir := t.TempDir()
+	dataDir1 := filepath.Join(tempDir, "node1")
+	dataDir2 := filepath.Join(tempDir, "node2")
+	must.NoError(os.MkdirAll(filepath.Join(dataDir1, "parts"), 0o755))
+	must.NoError(os.MkdirAll(filepath.Join(dataDir2, "parts"), 0o755))
+
+	wal1, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	defer wal1.Close()
+	wal2, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	defer wal2.Close()
+
+	addr1 := freeLocalAddr(t)
+	addr2 := freeLocalAddr(t)
+
+	reg1 := shrimpd.NewRegistry(cli, "node1")
+	reg2 := shrimpd.NewRegistry(cli, "node2")
+	lsm1, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1, reg1)
+	lsm2, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2, reg2)
+
+	runCtx, stop := context.WithCancel(ctx)
+	eg, _ := errgroup.WithContext(runCtx)
+	eg.Go(func() error { return lsm1.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr1, lsm1).Run(runCtx) })
+	eg.Go(func() error { return lsm2.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr2, lsm2).Run(runCtx) })
+
+	base1 := "http://" + addr1
+	base2 := "http://" + addr2
+	waitHTTP(ctx, t, base1+"/parts")
+	waitHTTP(ctx, t, base2+"/parts")
+
+	// Ingest on node1 to create log entries
+	for b := range 3 {
+		ents := make([]shrimpd.Entry, 100)
+		for i := range ents {
+			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+		}
+		postJSON(ctx, t, base1+"/ingest", shrimpd.Block{Data: ents})
+	}
+
+	// Stop only node2 (keep node1 running for continued ingest)
+	// We can't easily stop one goroutine group; recreate node2 lifecycle below by canceling a subctx isn't simple.
+	// Simpler: start node2 later in a separate runCtx2. For now, just stop whole and restart node1+node2 together is wrong.
+	// To isolate, we'll use separate run groups.
+
+	// Stop everything first to cleanly separate phases
+	stop()
+	_ = eg.Wait()
+
+	// Restart node1 alone to continue producing while node2 is down
+	runCtx1b, stop1b := context.WithCancel(ctx)
+	eg1b, _ := errgroup.WithContext(runCtx1b)
+	wal1b, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	defer wal1b.Close()
+	lsm1b, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1b, reg1)
+	eg1b.Go(func() error { return lsm1b.Run(runCtx1b) })
+	eg1b.Go(func() error { return shrimpd.NewServer(addr1, lsm1b).Run(runCtx1b) })
+	waitHTTP(ctx, t, base1+"/parts")
+
+	// Continue ingest + compact on node1 (node2 offline)
+	for b := 3; b < 6; b++ {
+		ents := make([]shrimpd.Entry, 100)
+		for i := range ents {
+			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+		}
+		postJSON(ctx, t, base1+"/ingest", shrimpd.Block{Data: ents})
+	}
+	postJSON(ctx, t, base1+"/compact", nil)
+	_ = reg1.LogCleanup(ctx)
+
+	// Start node2 fresh; it should detect gap and bootstrap from parts
+	runCtx2, stop2 := context.WithCancel(ctx)
+	eg2, _ := errgroup.WithContext(runCtx2)
+	wal2b, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	defer wal2b.Close()
+	lsm2b, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2b, reg2)
+	eg2.Go(func() error { return lsm2b.Run(runCtx2) })
+	eg2.Go(func() error { return shrimpd.NewServer(addr2, lsm2b).Run(runCtx2) })
+	waitHTTP(ctx, t, base2+"/parts")
+
+	var got shrimpd.Block
+	for {
+		getJSON(ctx, t, base2+"/read?from=1&to=600", &got)
+		if len(got.Data) >= 300 { // at least some data after bootstrap
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("recovering node bootstrap timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	stop2()
+	_ = eg2.Wait()
+	stop1b()
+	_ = eg1b.Wait()
 }

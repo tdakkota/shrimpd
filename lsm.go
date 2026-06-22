@@ -97,6 +97,12 @@ func (l *LSM) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Start background garbage collection loop.
+	go l.gcLoop(ctx)
+
+	// Start background log cleanup loop (truncates old log entries).
+	go l.reg.LogCleanupLoop(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -127,34 +133,45 @@ func (l *LSM) startup(ctx context.Context) error {
 		return fmt.Errorf("register: %w", err)
 	}
 
-	// Scan local parts from the disk metadata files.
-	files, err := filepath.Glob(filepath.Join(l.dataDir, "parts", "*.meta"))
+	snap, err := l.reg.GetBootstrapSnapshot(ctx)
 	if err != nil {
-		return fmt.Errorf("glob parts: %w", err)
+		return fmt.Errorf("get bootstrap snapshot: %w", err)
 	}
 
-	var localParts []PartMeta
-	for _, file := range files {
-		f, err := os.Open(file)
+	// Download any missing part files from peers before advertising a high queue pointer.
+	// This ensures we have the physical data for snap.Parts prior to advancing our pointer
+	// (so LogCleanup won't drop logs we might still conceptually need during transition).
+	var loaded []PartMeta
+	for id, meta := range snap.Parts {
+		if _, err := os.Stat(l.partMetaPath(id)); err == nil {
+			loaded = append(loaded, meta)
+			continue
+		}
+		block, err := fetchRemotePart(meta)
 		if err != nil {
-			slog.WarnContext(ctx, "failed to open meta file", "file", file, "error", err)
-			continue
+			return fmt.Errorf("bootstrap fetch %s: %w", id, err)
 		}
-		var meta PartMeta
-		decodeErr := json.NewDecoder(f).Decode(&meta)
-		f.Close()
-		if decodeErr != nil {
-			slog.WarnContext(ctx, "failed to decode meta file", "file", file, "error", decodeErr)
-			continue
+		if err := writeBlock(l.partPath(id), block); err != nil {
+			return err
 		}
-		localParts = append(localParts, meta)
+		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
+			_ = os.Remove(l.partPath(id))
+			return err
+		}
+		loaded = append(loaded, meta)
 	}
 
 	l.mu.Lock()
-	l.parts = localParts
+	l.parts = loaded
 	l.mu.Unlock()
 
-	slog.InfoContext(ctx, "loaded local parts from disk", "count", len(l.parts))
+	if snap.LogIndex > 0 {
+		if err := l.reg.SetQueuePointer(ctx, snap.LogIndex); err != nil {
+			return fmt.Errorf("set pointer: %w", err)
+		}
+	}
+
+	slog.InfoContext(ctx, "bootstrapped from etcd parts", "log_index", snap.LogIndex, "count", len(loaded))
 	return nil
 }
 
@@ -174,6 +191,21 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			// Check for log gap after possible truncation
+			if pointer > 0 {
+				exists, err := l.reg.logEntryExists(ctx, pointer+1)
+				if err == nil && !exists {
+					// gap detected: bootstrap
+					if err := l.bootstrapFromParts(ctx); err != nil {
+						slog.WarnContext(ctx, "bootstrap from parts after gap failed", "error", err)
+					} else if p, err := l.reg.GetQueuePointer(ctx); err == nil {
+						pointer = p
+					} else {
+						slog.WarnContext(ctx, "failed to update queue pointer", "error", err)
+					}
+				}
+			}
+
 			entries, err := l.reg.GetLogs(ctx, pointer+1)
 			if err != nil {
 				slog.WarnContext(ctx, "failed to get logs from etcd", "error", err)
@@ -183,6 +215,19 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 			for _, entry := range entries {
 				if entry.Index <= pointer {
 					continue
+				}
+
+				if entry.Index > pointer+1 {
+					// Log gap detected (e.g. after truncation while offline). Bootstrap from parts.
+					slog.WarnContext(ctx, "log gap detected in replication", "expected", pointer+1, "got", entry.Index)
+					if err := l.bootstrapFromParts(ctx); err != nil {
+						slog.WarnContext(ctx, "bootstrap from parts after gap failed", "error", err)
+					} else if p, err := l.reg.GetQueuePointer(ctx); err == nil {
+						pointer = p
+					} else {
+						slog.WarnContext(ctx, "failed to update queue pointer", "error", err)
+					}
+					break
 				}
 
 				if err := l.applyLogEntry(ctx, entry); err != nil {
@@ -197,6 +242,41 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (l *LSM) bootstrapFromParts(ctx context.Context) error {
+	snap, err := l.reg.GetBootstrapSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snap.LogIndex > 0 {
+		if err := l.reg.SetQueuePointer(ctx, snap.LogIndex); err != nil {
+			return fmt.Errorf("set queue pointer: %w", err)
+		}
+	}
+	var loaded []PartMeta
+	for id, meta := range snap.Parts {
+		if _, err := os.Stat(l.partMetaPath(id)); err == nil {
+			loaded = append(loaded, meta)
+			continue
+		}
+		block, err := fetchRemotePart(meta)
+		if err != nil {
+			return fmt.Errorf("bootstrap fetch failed: %w", err)
+		}
+		if err := writeBlock(l.partPath(id), block); err != nil {
+			return fmt.Errorf("write block: %w", err)
+		}
+		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
+			_ = os.Remove(l.partPath(id))
+			return fmt.Errorf("write meta: %w", err)
+		}
+		loaded = append(loaded, meta)
+	}
+	l.mu.Lock()
+	l.parts = loaded
+	l.mu.Unlock()
+	return nil
 }
 
 func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
@@ -220,12 +300,21 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 			return fmt.Errorf("write block: %w", err)
 		}
 		if err := writeMeta(metaPath, entry.Part); err != nil {
-			os.Remove(path)
+			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
 		}
 
 		l.mu.Lock()
-		l.parts = append(l.parts, entry.Part)
+		has := false
+		for _, p := range l.parts {
+			if p.ID == entry.Part.ID {
+				has = true
+				break
+			}
+		}
+		if !has {
+			l.parts = append(l.parts, entry.Part)
+		}
 		l.mu.Unlock()
 
 	case OpMerge:
@@ -242,29 +331,30 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 			return fmt.Errorf("write block: %w", err)
 		}
 		if err := writeMeta(metaPath, entry.Part); err != nil {
-			os.Remove(path)
+			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
 		}
 
 		oldSet := make(map[string]bool, len(entry.OldParts))
 		for _, id := range entry.OldParts {
 			oldSet[id] = true
-			if err := os.Remove(l.partPath(id)); err != nil && !os.IsNotExist(err) {
-				slog.WarnContext(ctx, "failed to remove old part file", "id", id, "error", err)
-			}
-			if err := os.Remove(l.partMetaPath(id)); err != nil && !os.IsNotExist(err) {
-				slog.WarnContext(ctx, "failed to remove old meta file", "id", id, "error", err)
-			}
+			// Deletion deferred to runGC with safety cutoff
 		}
 
 		l.mu.Lock()
 		next := make([]PartMeta, 0, len(l.parts))
+		has := false
 		for _, p := range l.parts {
 			if !oldSet[p.ID] {
+				if p.ID == entry.Part.ID {
+					has = true
+				}
 				next = append(next, p)
 			}
 		}
-		next = append(next, entry.Part)
+		if !has {
+			next = append(next, entry.Part)
+		}
 		l.parts = next
 		l.mu.Unlock()
 	}
@@ -302,14 +392,14 @@ func (l *LSM) flush(ctx context.Context) error {
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		l.mem.Write(entries)
 		return fmt.Errorf("write meta: %w", err)
 	}
 
 	if _, err := l.reg.AppendLog(ctx, OpPut, meta, nil); err != nil {
-		os.Remove(path)
-		os.Remove(metaPath)
+		_ = os.Remove(path)
+		_ = os.Remove(metaPath)
 		l.mem.Write(entries)
 		return fmt.Errorf("append log: %w", err)
 	}
@@ -320,7 +410,16 @@ func (l *LSM) flush(ctx context.Context) error {
 	}
 
 	l.mu.Lock()
-	l.parts = append(l.parts, meta)
+	has := false
+	for _, p := range l.parts {
+		if p.ID == meta.ID {
+			has = true
+			break
+		}
+	}
+	if !has {
+		l.parts = append(l.parts, meta)
+	}
 	l.mu.Unlock()
 
 	slog.InfoContext(ctx, "flushed part", "id", id, "level", 0, "count", meta.Count, "min_timestamp", meta.MinTimestamp, "max_timestamp", meta.MaxTimestamp)
@@ -389,26 +488,19 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return fmt.Errorf("write meta: %w", err)
 	}
 
 	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "count", len(merged))
 
 	if _, err := l.reg.AppendLog(ctx, OpMerge, meta, oldIDs); err != nil {
-		os.Remove(path)
-		os.Remove(metaPath)
+		_ = os.Remove(path)
+		_ = os.Remove(metaPath)
 		return fmt.Errorf("append log: %w", err)
 	}
 
-	for _, p := range l0 {
-		if err := os.Remove(l.partPath(p.ID)); err != nil && !os.IsNotExist(err) {
-			slog.WarnContext(ctx, "remove old part failed", "id", p.ID, "error", err)
-		}
-		if err := os.Remove(l.partMetaPath(p.ID)); err != nil && !os.IsNotExist(err) {
-			slog.WarnContext(ctx, "remove old meta failed", "id", p.ID, "error", err)
-		}
-	}
+	// Defer deletions to runGC (5m safety cutoff) to prevent 404s during peer replication.
 
 	oldSet := make(map[string]bool, len(l0))
 	for _, p := range l0 {
@@ -416,12 +508,18 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	}
 	l.mu.Lock()
 	next := make([]PartMeta, 0, len(l.parts))
+	has := false
 	for _, p := range l.parts {
 		if !oldSet[p.ID] {
+			if p.ID == meta.ID {
+				has = true
+			}
 			next = append(next, p)
 		}
 	}
-	next = append(next, meta)
+	if !has {
+		next = append(next, meta)
+	}
 	l.parts = next
 	l.mu.Unlock()
 
@@ -465,7 +563,7 @@ func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
 }
 
 // AllParts returns the copy of current memory parts list.
-func (l *LSM) AllParts(ctx context.Context) ([]PartMeta, error) {
+func (l *LSM) AllParts(_ context.Context) ([]PartMeta, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	copied := make([]PartMeta, len(l.parts))
@@ -517,13 +615,13 @@ func writeBlock(path string, b Block) error {
 	}
 	name := tmp.Name()
 	if err := json.NewEncoder(tmp).Encode(b); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -540,13 +638,13 @@ func writeMeta(path string, meta PartMeta) error {
 	}
 	name := tmp.Name()
 	if err := json.NewEncoder(tmp).Encode(meta); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -561,7 +659,7 @@ func fetchRemotePart(meta PartMeta) (Block, error) {
 		return Block{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
 	}
 	var b Block
@@ -575,4 +673,81 @@ func fetchRemotePart(meta PartMeta) (Block, error) {
 
 func newPartID(nodeID string) string {
 	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), nodeID)
+}
+
+// gcLoop periodically fetches the materialized active parts from etcd (/lsm/parts/)
+// and removes any local files that are not part of the active set. It also reconciles
+// the in-memory l.parts list to match the global state.
+func (l *LSM) gcLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := l.runGC(ctx); err != nil {
+				slog.WarnContext(ctx, "garbage collection failed", "error", err)
+			}
+		}
+	}
+}
+
+func (l *LSM) runGC(ctx context.Context) error {
+	active, err := l.reg.GetActiveParts(ctx)
+	if err != nil {
+		return fmt.Errorf("get active parts: %w", err)
+	}
+
+	// Clean up stale files on disk
+	files, err := os.ReadDir(filepath.Join(l.dataDir, "parts"))
+	if err != nil {
+		return fmt.Errorf("read parts dir: %w", err)
+	}
+
+	cutoff := time.Now().Add(-5 * time.Minute)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+
+		name := f.Name()
+		ext := filepath.Ext(name)
+		if ext != ".meta" && ext != ".json" {
+			continue
+		}
+
+		id := name[:len(name)-len(ext)]
+		if _, ok := active[id]; !ok {
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(cutoff) {
+				path := filepath.Join(l.dataDir, "parts", name)
+				if err := os.Remove(path); err == nil {
+					slog.InfoContext(ctx, "gc removed stale part file", "file", name)
+				}
+			}
+		}
+	}
+
+	// Safely reconcile local l.parts without dropping recently flushed parts
+	l.mu.Lock()
+	var reconciled []PartMeta
+	for _, p := range l.parts {
+		if _, ok := active[p.ID]; ok {
+			reconciled = append(reconciled, p)
+		} else {
+			info, err := os.Stat(l.partMetaPath(p.ID))
+			if err == nil && info.ModTime().After(cutoff) {
+				reconciled = append(reconciled, p)
+			}
+		}
+	}
+	l.parts = reconciled
+	l.mu.Unlock()
+
+	return nil
 }

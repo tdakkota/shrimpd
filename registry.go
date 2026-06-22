@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"path"
 	"strconv"
+	"strings"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -17,16 +19,19 @@ import (
 //	/lsm/nodes/{node-id}  → nodeInfo JSON   (ephemeral; disappears when lease expires on crash)
 //	/lsm/nodes/{node-id}/pointer → string   (persistent; local node's processed log index)
 const (
-	logPrefix  = "/lsm/log"
-	nodePrefix = "/lsm/nodes/"
-	leaseTTL   = 10 // seconds
+	logPrefix   = "/lsm/log"
+	partsPrefix = "/lsm/parts/"
+	nodePrefix  = "/lsm/nodes/"
+	leaseTTL    = 10 // seconds
 )
 
 // LogOp represents the mutation operation.
 type LogOp string
 
 const (
-	OpPut   LogOp = "PUT"
+	// OpPut and OpMerge are the supported log operations for part lifecycle.
+	OpPut LogOp = "PUT"
+	// OpMerge represents a compaction merge that replaces old parts with a new one.
 	OpMerge LogOp = "MERGE"
 )
 
@@ -34,7 +39,7 @@ const (
 type LogEntry struct {
 	Index    int64    `json:"index"`
 	Op       LogOp    `json:"op"`
-	Part     PartMeta `json:"part,omitempty"`
+	Part     PartMeta `json:"part"`
 	OldParts []string `json:"old_parts,omitempty"`
 	NodeID   string   `json:"node_id"`
 }
@@ -75,7 +80,11 @@ func (r *Registry) RegisterNode(ctx context.Context, addr string) error {
 		return err
 	}
 	go func() {
-		for range ch {
+		for {
+			if _, ok := <-ch; !ok {
+				break
+			}
+			// drain keepalive notifications
 		}
 		if ctx.Err() == nil {
 			slog.ErrorContext(ctx, "etcd lease keepalive failed", "node_id", r.nodeID)
@@ -89,7 +98,7 @@ func (r *Registry) RegisterNode(ctx context.Context, addr string) error {
 // Uses an optimistic transaction loop to determine the next sequential key.
 func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldParts []string) (int64, error) {
 	baseKey := "__" + logPrefix
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		resp, err := r.cli.Get(ctx, logPrefix+"/", clientv3.WithLastKey()...)
 		if err != nil {
 			return 0, err
@@ -111,7 +120,7 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldPa
 			if err != nil {
 				return 0, err
 			}
-			if len(respBase.Kvs) != 0 && string(respBase.Kvs[0].Value) != "" {
+			if len(respBase.Kvs) != 0 && len(respBase.Kvs[0].Value) != 0 {
 				seqNum, err := strconv.ParseInt(string(respBase.Kvs[0].Value), 10, 64)
 				if err != nil {
 					return 0, fmt.Errorf("parse base seq num: %w", err)
@@ -138,7 +147,23 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldPa
 		reqPrefix := clientv3.OpPut(baseKey, fmt.Sprintf("%016d", newSeqNum))
 		reqNewLog := clientv3.OpPut(newKey, string(b))
 
-		txnResp, err := r.cli.Txn(ctx).If(cmp).Then(reqPrefix, reqNewLog).Commit()
+		ops := []clientv3.Op{reqPrefix, reqNewLog}
+		partKey := partsPrefix + part.ID
+		pb, err := json.Marshal(part)
+		if err != nil {
+			return 0, err
+		}
+		switch op {
+		case OpPut:
+			ops = append(ops, clientv3.OpPut(partKey, string(pb)))
+		case OpMerge:
+			ops = append(ops, clientv3.OpPut(partKey, string(pb)))
+			for _, old := range oldParts {
+				ops = append(ops, clientv3.OpDelete(partsPrefix+old))
+			}
+		}
+
+		txnResp, err := r.cli.Txn(ctx).If(cmp).Then(ops...).Commit()
 		if err != nil {
 			return 0, err
 		}
@@ -169,6 +194,112 @@ func (r *Registry) GetLogs(ctx context.Context, fromIndex int64) ([]LogEntry, er
 	return entries, nil
 }
 
+// GetActiveParts returns the current active parts materialized in etcd under /lsm/parts/.
+func (r *Registry) GetActiveParts(ctx context.Context) (map[string]PartMeta, error) {
+	resp, err := r.cli.Get(ctx, partsPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[string]PartMeta, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		var p PartMeta
+		if err := json.Unmarshal(kv.Value, &p); err == nil {
+			active[p.ID] = p
+		}
+	}
+	return active, nil
+}
+
+// BootstrapSnapshot holds a consistent snapshot of the log tail and active parts.
+type BootstrapSnapshot struct {
+	LogIndex int64
+	Parts    map[string]PartMeta
+	Revision int64
+}
+
+// GetBootstrapSnapshot reads the latest log index and /lsm/parts under one revision for safe bootstrap.
+func (r *Registry) GetBootstrapSnapshot(ctx context.Context) (BootstrapSnapshot, error) {
+	var snap BootstrapSnapshot
+	respLog, err := r.cli.Get(ctx, logPrefix+"/", clientv3.WithLastKey()...)
+	if err != nil {
+		return snap, err
+	}
+	snap.Revision = respLog.Header.Revision
+	if len(respLog.Kvs) != 0 {
+		seqStr := path.Base(string(respLog.Kvs[0].Key))
+		if idx, err := strconv.ParseInt(seqStr, 10, 64); err == nil {
+			snap.LogIndex = idx
+		}
+	}
+	respParts, err := r.cli.Get(ctx, partsPrefix, clientv3.WithPrefix(), clientv3.WithRev(snap.Revision))
+	if err != nil {
+		return snap, err
+	}
+	snap.Parts = make(map[string]PartMeta, len(respParts.Kvs))
+	for _, kv := range respParts.Kvs {
+		var p PartMeta
+		if err := json.Unmarshal(kv.Value, &p); err == nil {
+			snap.Parts[p.ID] = p
+		}
+	}
+	return snap, nil
+}
+
+// logEntryExists reports whether a specific log index key exists.
+func (r *Registry) logEntryExists(ctx context.Context, idx int64) (bool, error) {
+	key := fmt.Sprintf("%s/%016d", logPrefix, idx)
+	resp, err := r.cli.Get(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	return len(resp.Kvs) != 0, nil
+}
+
+// LogCleanup removes log entries with index < min pointer among currently active nodes.
+func (r *Registry) LogCleanup(ctx context.Context) error {
+	active, err := r.GetActiveNodes(ctx)
+	if err != nil {
+		return err
+	}
+	ptrs, err := r.GetNodeQueuePointers(ctx)
+	if err != nil {
+		return err
+	}
+	minPtr := int64(-1)
+	for _, id := range active {
+		p := int64(0)
+		if v, ok := ptrs[id]; ok {
+			p = v
+		}
+		if minPtr < 0 || p < minPtr {
+			minPtr = p
+		}
+	}
+	if minPtr <= 0 {
+		return nil
+	}
+	startKey := fmt.Sprintf("%s/%016d", logPrefix, 0)
+	endKey := fmt.Sprintf("%s/%016d", logPrefix, minPtr)
+	_, err = r.cli.Delete(ctx, startKey, clientv3.WithRange(endKey))
+	return err
+}
+
+// LogCleanupLoop runs periodic log truncation while ctx is active.
+func (r *Registry) LogCleanupLoop(ctx context.Context) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.LogCleanup(ctx); err != nil {
+				slog.WarnContext(ctx, "log cleanup failed", "error", err)
+			}
+		}
+	}
+}
+
 // GetQueuePointer retrieves the last processed log index for this node.
 func (r *Registry) GetQueuePointer(ctx context.Context) (int64, error) {
 	key := fmt.Sprintf("%s%s/pointer", nodePrefix, r.nodeID)
@@ -187,10 +318,64 @@ func (r *Registry) GetQueuePointer(ctx context.Context) (int64, error) {
 	return pointer, nil
 }
 
+// GetLatestLogIndex returns the highest log index present, or 0 if none.
+func (r *Registry) GetLatestLogIndex(ctx context.Context) (int64, error) {
+	resp, err := r.cli.Get(ctx, logPrefix+"/", clientv3.WithLastKey()...)
+	if err != nil {
+		return 0, err
+	}
+	if len(resp.Kvs) == 0 {
+		return 0, nil
+	}
+	seqStr := path.Base(string(resp.Kvs[0].Key))
+	return strconv.ParseInt(seqStr, 10, 64)
+}
+
+// GetNodeQueuePointers returns map of nodeID -> pointer for all nodes under /lsm/nodes/.
+func (r *Registry) GetNodeQueuePointers(ctx context.Context) (map[string]int64, error) {
+	resp, err := r.cli.Get(ctx, nodePrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	ptrs := make(map[string]int64)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if !strings.HasSuffix(key, "/pointer") {
+			continue
+		}
+		// key: /lsm/nodes/{id}/pointer
+		id := key[len(nodePrefix) : len(key)-len("/pointer")]
+		val := string(kv.Value)
+		p, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			continue
+		}
+		ptrs[id] = p
+	}
+	return ptrs, nil
+}
+
+// GetActiveNodes returns node IDs that currently have an ephemeral lease entry.
+func (r *Registry) GetActiveNodes(ctx context.Context) ([]string, error) {
+	resp, err := r.cli.Get(ctx, nodePrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if strings.HasSuffix(key, "/pointer") {
+			continue
+		}
+		id := key[len(nodePrefix):]
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // SetQueuePointer stores the last processed log index for this node.
 func (r *Registry) SetQueuePointer(ctx context.Context, index int64) error {
 	key := fmt.Sprintf("%s%s/pointer", nodePrefix, r.nodeID)
 	_, err := r.cli.Put(ctx, key, strconv.FormatInt(index, 10))
 	return err
 }
-
