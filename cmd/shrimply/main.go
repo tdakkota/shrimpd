@@ -107,6 +107,7 @@ func main() {
 	fromStr := flag.String("from", "", "query starting timestamp (duration e.g. 5m, or Unix nanoseconds)")
 	toStr := flag.String("to", "", "query ending timestamp (duration e.g. 1m, or Unix nanoseconds)")
 	termFlag := flag.String("term", "", "filter term (can also be specified as positional arguments)")
+	parseFlag := flag.Bool("parse", false, "enables entry parsing")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: shrimply [options] [term]\n")
@@ -166,7 +167,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: failed to connect to server: %v\n", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -186,6 +187,10 @@ func main() {
 	}
 
 	for _, entry := range entries {
-		fmt.Println(formatEntry(entry))
+		s := strings.TrimSpace(entry.Data)
+		if *parseFlag {
+			s = formatEntry(entry)
+		}
+		fmt.Println(s)
 	}
 }

@@ -1,6 +1,7 @@
 package shrimpd
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -42,7 +43,13 @@ func NewServer(addr string, lsm *LSM) *Server {
 	mux.HandleFunc("GET /parts", s.handleParts)
 	mux.HandleFunc("POST /compact", s.handleCompact)
 
-	s.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	var handler http.Handler = mux
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.InfoContext(r.Context(), "incoming request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		mux.ServeHTTP(w, r)
+	})
+
+	s.srv = &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	return s
 }
 
@@ -104,7 +111,18 @@ type otlpLogRecordJSON struct {
 
 func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 	const maxBodySize = 32 << 20 // 32 MiB
-	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodySize))
+	var bodyReader io.ReadCloser = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		var err error
+		bodyReader, err = gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer bodyReader.Close()
+	}
+
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, bodyReader, maxBodySize))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -122,6 +140,7 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 		logsData, unmarshalErr = unmarshaler.UnmarshalLogs(bodyBytes)
 	}
 	if unmarshalErr != nil {
+		slog.WarnContext(r.Context(), "failed to unmarshal OTLP logs", "error", unmarshalErr, "content_type", contentType)
 		http.Error(w, "failed to unmarshal logs: "+unmarshalErr.Error(), http.StatusBadRequest)
 		return
 	}

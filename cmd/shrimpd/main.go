@@ -43,7 +43,11 @@ import (
 
 	"github.com/tdakkota/shrimpd"
 
+	slogmulti "github.com/samber/slog-multi"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/sdk/log"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -56,7 +60,24 @@ func main() {
 	)
 	flag.Parse()
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	consoleHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	var handler slog.Handler = consoleHandler
+
+	shutdown, otelHandler, err := initOTEL(context.Background(), *nodeID)
+	if err != nil {
+		slog.Warn("failed to initialize OpenTelemetry logging, falling back to console-only", "error", err)
+	} else {
+		handler = slogmulti.Fanout(consoleHandler, otelHandler)
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdown(shutdownCtx); err != nil {
+				slog.Warn("failed to shutdown OpenTelemetry LoggerProvider", "error", err)
+			}
+		}()
+	}
+
+	slog.SetDefault(slog.New(handler))
 
 	if err := os.MkdirAll(*dataDir+"/parts", 0o750); err != nil {
 		slog.Error("create data directory", "error", err)
@@ -107,3 +128,24 @@ func main() {
 		slog.Error("exit", "error", err)
 	}
 }
+
+func initOTEL(ctx context.Context, nodeID string) (func(context.Context) error, slog.Handler, error) {
+	exporter, err := otlploghttp.New(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	processor := log.NewBatchProcessor(exporter, log.WithExportInterval(1*time.Second))
+	provider := log.NewLoggerProvider(
+		log.WithProcessor(processor),
+	)
+
+	otelHandler := otelslog.NewHandler(nodeID, otelslog.WithLoggerProvider(provider))
+
+	shutdown := func(shutdownCtx context.Context) error {
+		return provider.Shutdown(shutdownCtx)
+	}
+
+	return shutdown, otelHandler, nil
+}
+
