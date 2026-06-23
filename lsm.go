@@ -25,9 +25,8 @@ import (
 const (
 	flushThreshold  = 100             // entries: eager flush when memtable exceeds this
 	flushInterval   = 5 * time.Second // time-based flush regardless of size
-	compactTrigger  = 4               // L0 parts before compaction kicks in
+	compactTrigger  = 4               // parts per level before compaction kicks in
 	compactInterval = 15 * time.Second
-	maxLevel        = 2 // maximum compaction level
 )
 
 var remoteHTTP = &http.Client{Timeout: 10 * time.Second}
@@ -587,13 +586,15 @@ func (l *LSM) Flush(ctx context.Context) error {
 // Compact forces compaction of data parts and then compacts the index, removing
 // entries for data part IDs that no longer exist.
 func (l *LSM) Compact(ctx context.Context) error {
-	// Force-compact L0 → L1, but use threshold logic for L1 → L2 so a single
-	// freshly-created L1 part isn't immediately re-merged into L2.
+	// Force-compact L0; use threshold logic for higher levels so a single
+	// freshly-created part isn't immediately re-merged.
 	if err := l.compactLevel(ctx, 0, true); err != nil {
 		return err
 	}
-	if err := l.compactLevel(ctx, 1, false); err != nil {
-		return err
+	for level := 1; level <= l.maxPartLevel(); level++ {
+		if err := l.compactLevel(ctx, level, false); err != nil {
+			return err
+		}
 	}
 	l.mu.RLock()
 	activeIDs := make(map[string]struct{}, len(l.parts))
@@ -604,20 +605,31 @@ func (l *LSM) Compact(ctx context.Context) error {
 	return l.idxEngine.Compact(ctx, activeIDs)
 }
 
-// compact merges all parts from levels 0 and 1 for this node.
-// Emits a MERGE operation to the etcd log.
+// compact merges parts at all levels for this node.
 func (l *LSM) compact(ctx context.Context, force bool) error {
-	if err := l.compactLevel(ctx, 0, force); err != nil {
-		return err
+	for level := 0; level <= l.maxPartLevel(); level++ {
+		if err := l.compactLevel(ctx, level, force); err != nil {
+			return err
+		}
 	}
-	return l.compactLevel(ctx, 1, force)
+	return nil
+}
+
+// maxPartLevel returns the highest level present across all local parts.
+func (l *LSM) maxPartLevel() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	max := 0
+	for _, p := range l.parts {
+		if p.NodeID == l.nodeID && p.Level > max {
+			max = p.Level
+		}
+	}
+	return max
 }
 
 // compactLevel merges all parts at the given level into one part at level+1.
 func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
-	if level >= maxLevel {
-		return nil
-	}
 
 	l.mu.RLock()
 	var levelParts []PartMeta
