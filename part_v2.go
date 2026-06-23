@@ -76,12 +76,8 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 
 	// Write each block
 	payloadOffset := dirOffset + dirSize
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return nil, fmt.Errorf("zstd writer: %w", err)
-	}
+	enc := encoderPool.Get().(*zstd.Encoder)
+	defer encoderPool.Put(enc)
 
 	for bi, block := range blocks {
 		// Build columnar JSON: {"ts":[...],"d":[...]}
@@ -246,11 +242,11 @@ func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
 		return nil, fmt.Errorf("read block %d: %w", idx, err)
 	}
 
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, fmt.Errorf("zstd reader: %w", err)
-	}
-	defer dec.Close()
+	dec := decoderPool.Get().(*zstd.Decoder)
+	defer func() {
+		_ = dec.Reset(nil)
+		decoderPool.Put(dec)
+	}()
 
 	decoded, err := dec.DecodeAll(compressed, nil)
 	if err != nil {
