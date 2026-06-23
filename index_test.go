@@ -1,6 +1,7 @@
 package shrimpd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -167,4 +168,176 @@ func TestGracefulDegradation(t *testing.T) {
 	lo, hi := sparseRange([]SparseEntry{}, 0, 1000)
 	require.Equal(t, 0, lo)
 	require.Equal(t, 1<<31-1, hi)
+}
+
+func TestBuildIndexEntries(t *testing.T) {
+	ents := []Entry{
+		{Timestamp: 1, Data: "hello world hello"},
+		{Timestamp: 2, Data: "world test"},
+	}
+	got := BuildIndexEntries("part-1", ents)
+	// Tokens should be "hello", "test", "world" (each once, sorted, mapped to part-1)
+	want := []IndexEntry{
+		{Token: "hello", DataID: "part-1"},
+		{Token: "test", DataID: "part-1"},
+		{Token: "world", DataID: "part-1"},
+	}
+	require.Equal(t, want, got)
+}
+
+func TestIndexWAL(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "index-wal.jsonl")
+
+	wal, err := OpenIndexWAL(walPath)
+	require.NoError(t, err)
+
+	entries := []IndexEntry{
+		{Token: "hello", DataID: "part-1"},
+		{Token: "world", DataID: "part-1"},
+	}
+
+	require.NoError(t, wal.Append(entries))
+	require.NoError(t, wal.Close())
+
+	// Corrupt trailing line by appending junk
+	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteString("invalid json line\n")
+	require.NoError(t, err)
+	f.Close()
+
+	// Recover
+	wal2, err := OpenIndexWAL(walPath)
+	require.NoError(t, err)
+	defer wal2.Close()
+
+	recovered, err := wal2.Recover()
+	require.NoError(t, err)
+	require.Equal(t, entries, recovered, "should recover valid entries and skip corrupt trailing line")
+
+	// Rotate
+	require.NoError(t, wal2.Rotate())
+	recovered2, err := wal2.Recover()
+	require.NoError(t, err)
+	require.Empty(t, recovered2)
+}
+
+func TestIndexEngine_LookupAndFlush(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := NewIndexEngine("node-1", dir)
+	require.NoError(t, err)
+	defer engine.Close()
+
+	// Case 1: Lookup incomplete initially because parts are not covered
+	candidates := []PartMeta{{ID: "part-1"}}
+	_, complete, err := engine.Lookup(context.Background(), "hello", candidates)
+	require.NoError(t, err)
+	require.False(t, complete, "should be incomplete when candidates are not marked covered")
+
+	// Mark covered
+	require.NoError(t, engine.MarkCovered([]string{"part-1"}))
+
+	// Case 2: Lookup in memtable before flush
+	entries := []IndexEntry{
+		{Token: "hello", DataID: "part-1"},
+		{Token: "world", DataID: "part-1"},
+	}
+	require.NoError(t, engine.Write(entries))
+
+	matches, complete, err := engine.Lookup(context.Background(), "hello", candidates)
+	require.NoError(t, err)
+	require.True(t, complete)
+	require.Contains(t, matches, "part-1")
+
+	// Case 3: Flush and lookup
+	require.NoError(t, engine.Flush(context.Background()))
+
+	// Memtable should be empty now, results from flushed part
+	matches2, complete2, err := engine.Lookup(context.Background(), "hello", candidates)
+	require.NoError(t, err)
+	require.True(t, complete2)
+	require.Contains(t, matches2, "part-1")
+
+	// Check min/max bounds on flushed metadata
+	require.Len(t, engine.parts, 1)
+	require.Equal(t, "hello", engine.parts[0].MinToken)
+	require.Equal(t, "world", engine.parts[0].MaxToken)
+}
+
+func TestIndexEngine_MultiTokenLookup(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := NewIndexEngine("node-1", dir)
+	require.NoError(t, err)
+	defer engine.Close()
+
+	require.NoError(t, engine.MarkCovered([]string{"part-1", "part-2"}))
+
+	entries := []IndexEntry{
+		{Token: "hello", DataID: "part-1"},
+		{Token: "world", DataID: "part-1"},
+		{Token: "hello", DataID: "part-2"},
+		{Token: "test", DataID: "part-2"},
+	}
+	require.NoError(t, engine.Write(entries))
+	require.NoError(t, engine.Flush(context.Background()))
+
+	candidates := []PartMeta{{ID: "part-1"}, {ID: "part-2"}}
+
+	// Querying "hello" should return both parts
+	m1, c1, err := engine.Lookup(context.Background(), "hello", candidates)
+	require.NoError(t, err)
+	require.True(t, c1)
+	require.Len(t, m1, 2)
+	require.Contains(t, m1, "part-1")
+	require.Contains(t, m1, "part-2")
+
+	// Querying "hello world" should only return part-1 (intersection)
+	m2, c2, err := engine.Lookup(context.Background(), "hello world", candidates)
+	require.NoError(t, err)
+	require.True(t, c2)
+	require.Len(t, m2, 1)
+	require.Contains(t, m2, "part-1")
+}
+
+func TestIndexEngine_Compaction(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := NewIndexEngine("node-1", dir)
+	require.NoError(t, err)
+	defer engine.Close()
+
+	require.NoError(t, engine.MarkCovered([]string{"part-1", "part-2", "part-3"}))
+
+	// Create two L0 index parts
+	require.NoError(t, engine.Write([]IndexEntry{{Token: "hello", DataID: "part-1"}, {Token: "world", DataID: "part-2"}}))
+	require.NoError(t, engine.Flush(context.Background()))
+
+	require.NoError(t, engine.Write([]IndexEntry{{Token: "hello", DataID: "part-2"}, {Token: "test", DataID: "part-3"}}))
+	require.NoError(t, engine.Flush(context.Background()))
+
+	require.Len(t, engine.parts, 2)
+
+	// Compact with active data IDs: "part-1" and "part-2" ("part-3" is stale)
+	activeIDs := map[string]struct{}{
+		"part-1": {},
+		"part-2": {},
+	}
+	require.NoError(t, engine.Compact(context.Background(), activeIDs))
+
+	// Should have merged L0 parts into one Level 1 part
+	require.Len(t, engine.parts, 1)
+	require.Equal(t, 1, engine.parts[0].Level)
+
+	// Lookup "test" (which was only in part-3) should not find anything and part-3 should be removed from covered
+	candidates := []PartMeta{{ID: "part-1"}, {ID: "part-2"}}
+	m, c, err := engine.Lookup(context.Background(), "test", candidates)
+	require.NoError(t, err)
+	require.True(t, c)
+	require.Empty(t, m)
+
+	// Verify that covered map is cleaned up
+	engine.mu.RLock()
+	_, cov3 := engine.covered["part-3"]
+	engine.mu.RUnlock()
+	require.False(t, cov3, "part-3 should be removed from covered after compaction")
 }

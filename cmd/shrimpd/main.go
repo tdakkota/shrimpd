@@ -148,4 +148,3 @@ func initOTEL(ctx context.Context, nodeID string) (func(context.Context) error, 
 
 	return shutdown, otelHandler, nil
 }
-

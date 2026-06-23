@@ -39,22 +39,31 @@ type LSM struct {
 
 	mu    sync.RWMutex
 	parts []PartMeta // all parts replicated locally, kept in sync with etcd log
+
+	idxEngine *IndexEngine // Separate Index Engine
 }
 
 // NewLSM creates an LSM instance and replays unflushed entries from the WAL.
 func NewLSM(nodeID, addr, dataDir string, wal *WAL, reg *Registry) (*LSM, error) {
+	idx, err := NewIndexEngine(nodeID, dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("new index engine: %w", err)
+	}
+
 	l := &LSM{
-		nodeID:   nodeID,
-		addr:     addr,
-		dataDir:  dataDir,
-		mem:      &MemTable{},
-		wal:      wal,
-		reg:      reg,
-		flushSig: make(chan struct{}, 1),
+		nodeID:    nodeID,
+		addr:      addr,
+		dataDir:   dataDir,
+		mem:       &MemTable{},
+		wal:       wal,
+		reg:       reg,
+		flushSig:  make(chan struct{}, 1),
+		idxEngine: idx,
 	}
 	// Replay WAL to recover any entries not yet flushed to a part.
 	entries, err := wal.Recover()
 	if err != nil {
+		_ = idx.Close()
 		return nil, fmt.Errorf("wal recover: %w", err)
 	}
 	if len(entries) > 0 {
@@ -110,10 +119,15 @@ func (l *LSM) Run(ctx context.Context) error {
 			if l.mem.Len() > 0 {
 				_ = l.flush(context.Background())
 			}
+			_ = l.idxEngine.Close()
 			return ctx.Err()
 		case <-l.flushSig:
 			if err := l.flush(ctx); err != nil {
 				slog.ErrorContext(ctx, "flush failed", "error", err)
+			}
+		case <-l.idxEngine.flushSig:
+			if err := l.idxEngine.Flush(ctx); err != nil {
+				slog.ErrorContext(ctx, "index flush failed", "error", err)
 			}
 		case <-flushTick.C:
 			if l.mem.Len() > 0 {
@@ -121,9 +135,24 @@ func (l *LSM) Run(ctx context.Context) error {
 					slog.ErrorContext(ctx, "flush failed", "error", err)
 				}
 			}
+			if l.idxEngine.mem.Len() > 0 {
+				if err := l.idxEngine.Flush(ctx); err != nil {
+					slog.ErrorContext(ctx, "index flush failed", "error", err)
+				}
+			}
 		case <-compactTick.C:
 			if err := l.compact(ctx, false); err != nil {
 				slog.ErrorContext(ctx, "compact failed", "error", err)
+			}
+			// Trigger index compaction with active data part IDs
+			l.mu.RLock()
+			activeIDs := make(map[string]struct{})
+			for _, p := range l.parts {
+				activeIDs[p.ID] = struct{}{}
+			}
+			l.mu.RUnlock()
+			if err := l.idxEngine.Compact(ctx, activeIDs); err != nil {
+				slog.ErrorContext(ctx, "index compaction failed", "error", err)
 			}
 		}
 	}
@@ -182,6 +211,28 @@ func (l *LSM) startup(ctx context.Context) error {
 			} else {
 				slog.WarnContext(ctx, "repair sidecar: read part failed", "id", p.ID, "error", err)
 			}
+		}
+	}
+
+	// Reconcile index coverage for all loaded parts.
+	for _, p := range l.parts {
+		l.idxEngine.mu.RLock()
+		_, covered := l.idxEngine.covered[p.ID]
+		l.idxEngine.mu.RUnlock()
+		if !covered {
+			block, err := l.readLocalPart(p.ID)
+			if err != nil {
+				slog.WarnContext(ctx, "startup index reconciliation: read part failed", "id", p.ID, "error", err)
+				continue
+			}
+			if err := l.idxEngine.ReindexPart(ctx, p, block); err != nil {
+				slog.WarnContext(ctx, "startup index reconciliation: reindex failed", "id", p.ID, "error", err)
+			}
+		}
+	}
+	if l.idxEngine.mem.Len() > 0 {
+		if err := l.idxEngine.Flush(ctx); err != nil {
+			slog.WarnContext(ctx, "startup index reconciliation: flush failed", "error", err)
 		}
 	}
 
@@ -290,6 +341,28 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 	l.mu.Lock()
 	l.parts = loaded
 	l.mu.Unlock()
+
+	// Reconcile index coverage for all loaded parts.
+	for _, p := range loaded {
+		l.idxEngine.mu.RLock()
+		_, covered := l.idxEngine.covered[p.ID]
+		l.idxEngine.mu.RUnlock()
+		if !covered {
+			block, err := l.readLocalPart(p.ID)
+			if err != nil {
+				slog.WarnContext(ctx, "bootstrap index reconciliation: read part failed", "id", p.ID, "error", err)
+				continue
+			}
+			if err := l.idxEngine.ReindexPart(ctx, p, block); err != nil {
+				slog.WarnContext(ctx, "bootstrap index reconciliation: reindex failed", "id", p.ID, "error", err)
+			}
+		}
+	}
+	if l.idxEngine.mem.Len() > 0 {
+		if err := l.idxEngine.Flush(ctx); err != nil {
+			slog.WarnContext(ctx, "bootstrap index reconciliation: flush failed", "error", err)
+		}
+	}
 	return nil
 }
 
@@ -331,6 +404,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		}
 		l.mu.Unlock()
 
+		if err := l.idxEngine.ReindexPart(ctx, entry.Part, block); err != nil {
+			slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+		}
+
 	case OpMerge:
 		slog.InfoContext(ctx, "replicating MERGE part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
 		block, err := fetchRemotePart(entry.Part)
@@ -371,6 +448,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		}
 		l.parts = next
 		l.mu.Unlock()
+
+		if err := l.idxEngine.ReindexPart(ctx, entry.Part, block); err != nil {
+			slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+		}
 	}
 
 	return nil
@@ -445,6 +526,15 @@ func (l *LSM) flush(ctx context.Context) error {
 		l.parts = append(l.parts, meta)
 	}
 	l.mu.Unlock()
+
+	idxEntries := BuildIndexEntries(meta.ID, entries)
+	if err := l.idxEngine.Write(idxEntries); err != nil {
+		slog.WarnContext(ctx, "failed to write index entries on flush", "id", meta.ID, "error", err)
+	} else {
+		if err := l.idxEngine.MarkCovered([]string{meta.ID}); err != nil {
+			slog.WarnContext(ctx, "failed to mark covered on flush", "id", meta.ID, "error", err)
+		}
+	}
 
 	slog.InfoContext(ctx, "flushed part", "id", id, "level", 0, "count", meta.Count, "min_timestamp", meta.MinTimestamp, "max_timestamp", meta.MaxTimestamp)
 	return nil
@@ -556,25 +646,58 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	l.parts = next
 	l.mu.Unlock()
 
+	idxEntries := BuildIndexEntries(meta.ID, merged)
+	if err := l.idxEngine.Write(idxEntries); err != nil {
+		slog.WarnContext(ctx, "failed to write index entries on compaction", "id", meta.ID, "error", err)
+	} else {
+		if err := l.idxEngine.MarkCovered([]string{meta.ID}); err != nil {
+			slog.WarnContext(ctx, "failed to mark covered on compaction", "id", meta.ID, "error", err)
+		}
+	}
+
 	slog.InfoContext(ctx, "compacted parts", "level0_count", len(l0), "id", id, "level", 1, "count", len(merged))
 	return nil
 }
 
-// Query returns all entries in [from, to] across all nodes by reading locally replicated parts.
-// Optional term enables L2 (token) and L1 (sparse) pruning.
+// Query returns entries within the given timestamp range, optionally filtered by term.
 func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, error) {
 	l.mu.RLock()
 	allParts := make([]PartMeta, len(l.parts))
 	copy(allParts, l.parts)
 	l.mu.RUnlock()
 
-	result := make([]Entry, 0)
+	// Step 1: Filter data parts by timestamp range
+	var timeParts []PartMeta
 	for _, meta := range allParts {
-		if !meta.overlaps(from, to) {
-			continue
+		if meta.overlaps(from, to) {
+			timeParts = append(timeParts, meta)
 		}
-		if term != "" && !hasToken(meta.Tokens, term) {
-			continue
+	}
+
+	// Step 2-4: Filter by index or fall back to old behavior
+	useIndexFilter := false
+	var indexedPartIDs map[string]struct{}
+	if term != "" {
+		matches, complete, err := l.idxEngine.Lookup(ctx, term, timeParts)
+		if err != nil {
+			slog.WarnContext(ctx, "index lookup failed, falling back to scanning", "error", err)
+		} else if complete {
+			useIndexFilter = true
+			indexedPartIDs = matches
+		}
+	}
+
+	result := make([]Entry, 0)
+	for _, meta := range timeParts {
+		if useIndexFilter {
+			if _, matched := indexedPartIDs[meta.ID]; !matched {
+				continue
+			}
+		} else {
+			// Fallback: use legacy PartMeta.Tokens pruning if available
+			if term != "" && !hasToken(meta.Tokens, term) {
+				continue
+			}
 		}
 
 		block, err := l.readLocalPart(meta.ID)

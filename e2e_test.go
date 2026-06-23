@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +24,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
 )
-
 
 func TestDaemonSmoke(t *testing.T) {
 	if testing.Short() {
@@ -821,3 +821,154 @@ func TestShrimplyCLI(t *testing.T) {
 	must.NotContains(stdout.String(), "hello from test") // because limit is 2 and we have 3
 }
 
+func TestDaemonIndexE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	etcdEndpoint := startEtcd(ctx, t)
+	dataDir := t.TempDir()
+	must.NoError(os.MkdirAll(filepath.Join(dataDir, "parts"), 0o755))
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{etcdEndpoint},
+		DialTimeout: 5 * time.Second,
+	})
+	must.NoError(err)
+	defer func() {
+		must.NoError(cli.Close())
+	}()
+	waitEtcd(ctx, t, cli)
+
+	runDaemon := func(dir string) (string, func()) {
+		wal, err := shrimpd.OpenWAL(filepath.Join(dir, "wal.jsonl"))
+		must.NoError(err)
+
+		addr := freeLocalAddr(t)
+		lsm, err := shrimpd.NewLSM("node1", addr, dir, wal, shrimpd.NewRegistry(cli, "node1"))
+		must.NoError(err)
+
+		runCtx, stop := context.WithCancel(ctx)
+		eg, runCtx := errgroup.WithContext(runCtx)
+		eg.Go(func() error { return lsm.Run(runCtx) })
+
+		srv := shrimpd.NewServer(addr, lsm)
+		eg.Go(func() error { return srv.Run(runCtx) })
+
+		baseURL := "http://" + addr
+		waitHTTP(ctx, t, baseURL+"/parts")
+
+		cleanup := func() {
+			stop()
+			_ = eg.Wait()
+			_ = wal.Close()
+		}
+		return addr, cleanup
+	}
+
+	// 1. Start daemon and ingest logs to force flushes
+	addr1, cleanup1 := runDaemon(dataDir)
+	baseURL1 := "http://" + addr1
+
+	// Ingest 2 blocks with different unique terms
+	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+		{Timestamp: 100, Data: "uniqueapple logs message"},
+		{Timestamp: 200, Data: "uniquebanana logs message"},
+	}})
+
+	// Wait for a flush or force it (flush threshold is 100, so we can write 100 logs or wait flushInterval=5s)
+	time.Sleep(6 * time.Second) // wait for data flushInterval
+
+	// Verify data part was created
+	var partsBefore []shrimpd.PartMeta
+	getJSON(ctx, t, baseURL1+"/parts", &partsBefore)
+	// We expect at least 1 part
+	must.NotEmpty(partsBefore)
+
+	// Check if index parts exist
+	indexDir := filepath.Join(dataDir, "index")
+	waitIndexFiles := func(msg string) {
+		t.Helper()
+		for {
+			files, err := os.ReadDir(indexDir)
+			must.NoError(err)
+			hasIndexPart := false
+			hasCoveredJSON := false
+			for _, f := range files {
+				if strings.HasSuffix(f.Name(), ".json") && f.Name() != "covered.json" {
+					hasIndexPart = true
+				}
+				if f.Name() == "covered.json" {
+					hasCoveredJSON = true
+				}
+			}
+			if hasIndexPart && hasCoveredJSON {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				require.Failf(t, "index files", "timed out waiting for index files (%s): %v", msg, ctx.Err())
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	waitIndexFiles("after flush")
+
+	// Query using unique term
+	var qApple shrimpd.Block
+	getJSON(ctx, t, baseURL1+"/query?from=100&to=200&term=uniqueapple", &qApple)
+	must.Len(qApple.Data, 1)
+	must.Equal("uniqueapple logs message", qApple.Data[0].Data)
+
+	cleanup1()
+
+	// 2. Restart and verification of rebuild/reconciliation
+	// Delete index files
+	must.NoError(os.RemoveAll(indexDir))
+
+	// Restart
+	addr2, cleanup2 := runDaemon(dataDir)
+	baseURL2 := "http://" + addr2
+
+	// Verify that indexDir now contains index parts and covered.json again (rebuilt on startup).
+	// waitHTTP only confirms the HTTP server is up; lsm.Run's startup reconciliation
+	// may still be in progress, so poll until the index files appear.
+	waitIndexFiles("after restart rebuild")
+
+	// Query still works
+	var qBanana shrimpd.Block
+	getJSON(ctx, t, baseURL2+"/query?from=100&to=200&term=uniquebanana", &qBanana)
+	must.Len(qBanana.Data, 1)
+	must.Equal("uniquebanana logs message", qBanana.Data[0].Data)
+
+	// 3. Compaction test
+	// Ingest more logs to create another L0 part
+	postJSON(ctx, t, baseURL2+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+		{Timestamp: 300, Data: "uniquecherry logs message"},
+	}})
+	time.Sleep(6 * time.Second) // wait for data flushInterval
+
+	// Force compaction
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL2+"/compact", http.NoBody)
+	must.NoError(err)
+	resp, err := http.DefaultClient.Do(req)
+	must.NoError(err)
+	must.Equal(http.StatusNoContent, resp.StatusCode)
+	resp.Body.Close()
+
+	// Allow compaction + background index compaction to run (compactInterval=15s, but we trigger it in ticks)
+	time.Sleep(17 * time.Second)
+
+	// Query should still work and find cherry
+	var qCherry shrimpd.Block
+	getJSON(ctx, t, baseURL2+"/query?from=100&to=400&term=uniquecherry", &qCherry)
+	must.Len(qCherry.Data, 1)
+	must.Equal("uniquecherry logs message", qCherry.Data[0].Data)
+
+	cleanup2()
+}

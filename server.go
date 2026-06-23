@@ -43,8 +43,7 @@ func NewServer(addr string, lsm *LSM) *Server {
 	mux.HandleFunc("GET /parts", s.handleParts)
 	mux.HandleFunc("POST /compact", s.handleCompact)
 
-	var handler http.Handler = mux
-	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slog.InfoContext(r.Context(), "incoming request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
@@ -111,7 +110,7 @@ type otlpLogRecordJSON struct {
 
 func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 	const maxBodySize = 32 << 20 // 32 MiB
-	var bodyReader io.ReadCloser = r.Body
+	bodyReader := r.Body
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		var err error
 		bodyReader, err = gzip.NewReader(r.Body)
@@ -119,7 +118,7 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		defer bodyReader.Close()
+		defer func() { _ = bodyReader.Close() }()
 	}
 
 	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, bodyReader, maxBodySize))
@@ -200,11 +199,11 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 					Scope:             sObj,
 				}
 
-			dataBytes, err := json.Marshal(entryJSON)
-			if err != nil {
-				slog.WarnContext(r.Context(), "skip OTLP record: marshal failed", "error", err)
-				continue
-			}
+				dataBytes, err := json.Marshal(entryJSON)
+				if err != nil {
+					slog.WarnContext(r.Context(), "skip OTLP record: marshal failed", "error", err)
+					continue
+				}
 
 				entries = append(entries, Entry{
 					Timestamp: int64(ts),

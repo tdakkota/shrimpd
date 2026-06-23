@@ -37,3 +37,25 @@ type PartMeta struct {
 func (m PartMeta) overlaps(from, to int64) bool {
 	return m.MaxTimestamp >= from && m.MinTimestamp <= to
 }
+
+// IndexEntry represents a mapping from a token to a data part ID.
+type IndexEntry struct {
+	Token  string `json:"token"`
+	DataID string `json:"data_id"`
+}
+
+// IndexBlock is the file format for a collection of index entries.
+type IndexBlock struct {
+	Entries []IndexEntry `json:"entries"`
+}
+
+// IndexPartMeta describes an immutable index part stored on disk.
+type IndexPartMeta struct {
+	ID        string `json:"id"`
+	NodeID    string `json:"node_id"`
+	Level     int    `json:"level"`
+	MinToken  string `json:"min_token"`
+	MaxToken  string `json:"max_token"`
+	Count     int    `json:"count"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+}
