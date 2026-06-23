@@ -2,6 +2,7 @@
 package shrimpd
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -181,9 +182,10 @@ func (l *LSM) startup(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("bootstrap fetch %s: %w", id, err)
 		}
-		if err := writeBlock(l.partPath(id), block); err != nil {
+		if err := writeBlock(l.partPath(id), block, compressionZstd); err != nil {
 			return err
 		}
+		meta.Compression = compressionZstd
 		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return err
@@ -329,9 +331,10 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("bootstrap fetch failed: %w", err)
 		}
-		if err := writeBlock(l.partPath(id), block); err != nil {
+		if err := writeBlock(l.partPath(id), block, compressionZstd); err != nil {
 			return fmt.Errorf("write block: %w", err)
 		}
+		meta.Compression = compressionZstd
 		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return fmt.Errorf("write meta: %w", err)
@@ -383,9 +386,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		path := l.partPath(entry.Part.ID)
 		metaPath := l.partMetaPath(entry.Part.ID)
 
-		if err := writeBlock(path, block); err != nil {
+		if err := writeBlock(path, block, compressionZstd); err != nil {
 			return fmt.Errorf("write block: %w", err)
 		}
+		entry.Part.Compression = compressionZstd
 		if err := writeMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -418,9 +422,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		path := l.partPath(entry.Part.ID)
 		metaPath := l.partMetaPath(entry.Part.ID)
 
-		if err := writeBlock(path, block); err != nil {
+		if err := writeBlock(path, block, compressionZstd); err != nil {
 			return fmt.Errorf("write block: %w", err)
 		}
+		entry.Part.Compression = compressionZstd
 		if err := writeMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -471,7 +476,7 @@ func (l *LSM) flush(ctx context.Context) error {
 	metaPath := l.partMetaPath(id)
 
 	slog.DebugContext(ctx, "creating new part", "id", id, "count", len(entries))
-	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), Data: entries}); err != nil {
+	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), Data: entries}, compressionZstd); err != nil {
 		l.mem.Write(entries) // restore on failure so next flush retries
 		return fmt.Errorf("write block: %w", err)
 	}
@@ -492,6 +497,7 @@ func (l *LSM) flush(ctx context.Context) error {
 		Count:        len(entries),
 		Addr:         l.addr,
 		Tokens:       buildTokenSet(entries),
+		Compression:  compressionZstd,
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
@@ -587,7 +593,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	path := l.partPath(id)
 	metaPath := l.partMetaPath(id)
 
-	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), SourceBlocks: oldIDs, Data: merged}); err != nil {
+	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), SourceBlocks: oldIDs, Data: merged}, compressionZstd); err != nil {
 		return err
 	}
 
@@ -606,6 +612,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		Count:        len(merged),
 		Addr:         l.addr,
 		Tokens:       buildTokenSet(merged),
+		Compression:  compressionZstd,
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
@@ -742,18 +749,44 @@ func (l *LSM) AllParts(_ context.Context) ([]PartMeta, error) {
 	return copied, nil
 }
 
-// ServeLocalPart streams the raw part file to w. Used by /part/{id}.
-func (l *LSM) ServeLocalPart(id string, w io.Writer) error {
-	f, err := os.Open(l.partPath(id))
+// ServeLocalPart streams the part file to w, used by /part/{id}.
+// If the part is zstd-compressed on disk and the client advertises Accept-Encoding: zstd,
+// the compressed bytes are streamed verbatim with Content-Encoding: zstd; otherwise the
+// part is decompressed on the fly so legacy peers and humans get plain JSON.
+func (l *LSM) ServeLocalPart(r *http.Request, w http.ResponseWriter) error {
+	id := r.PathValue("id")
+	f, err := os.Open(l.partPath(id)) // #nosec G304 -- trusted internal part path
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(w, f)
-	closeErr := f.Close()
-	if copyErr != nil {
+	defer func() { _ = f.Close() }()
+
+	br := bufio.NewReaderSize(f, 512)
+	head, err := br.Peek(4)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	onDisk := detectAlgo(head)
+	acceptZstd := strings.Contains(r.Header.Get("Accept-Encoding"), compressionZstd)
+
+	if onDisk == compressionZstd && acceptZstd {
+		w.Header().Set("Content-Encoding", compressionZstd)
+		_, copyErr := io.Copy(w, br)
 		return copyErr
 	}
-	return closeErr
+
+	if onDisk == compressionZstd {
+		dec, err := newZstdDecompressReader(br)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = dec.Close() }()
+		_, copyErr := io.Copy(w, dec)
+		return copyErr
+	}
+
+	_, copyErr := io.Copy(w, br)
+	return copyErr
 }
 
 func (l *LSM) partPath(id string) string {
@@ -769,30 +802,52 @@ func (l *LSM) sidecarPath(id string) string {
 }
 
 func (l *LSM) readLocalPart(id string) (Block, error) {
-	f, err := os.Open(l.partPath(id))
+	f, err := os.Open(l.partPath(id)) // #nosec G304 -- trusted internal part path
 	if err != nil {
 		return Block{}, err
 	}
+	r, _, err := openBlockReader(f)
+	if err != nil {
+		_ = f.Close()
+		return Block{}, err
+	}
 	var b Block
-	decodeErr := json.NewDecoder(f).Decode(&b)
-	closeErr := f.Close()
+	decodeErr := json.NewDecoder(r).Decode(&b)
+	rCloseErr := r.Close()
+	fCloseErr := f.Close()
 	if decodeErr != nil {
 		return Block{}, decodeErr
 	}
-	return b, closeErr
+	if rCloseErr != nil {
+		return Block{}, rCloseErr
+	}
+	return b, fCloseErr
 }
 
 // writeBlock writes b to path atomically via a temp-file + rename.
-func writeBlock(path string, b Block) error {
+func writeBlock(path string, b Block, algo string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
-	if err := json.NewEncoder(tmp).Encode(b); err != nil {
+	cw, err := newCompressingWriter(tmp, algo)
+	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(name)
 		return err
+	}
+	encErr := json.NewEncoder(cw).Encode(b)
+	closeErr := cw.Close()
+	if encErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return encErr
+	}
+	if closeErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return closeErr
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -829,7 +884,12 @@ func writeMeta(path string, meta PartMeta) error {
 }
 
 func fetchRemotePart(meta PartMeta) (Block, error) {
-	resp, err := remoteHTTP.Get("http://" + meta.Addr + "/part/" + meta.ID)
+	req, err := http.NewRequest(http.MethodGet, "http://"+meta.Addr+"/part/"+meta.ID, http.NoBody)
+	if err != nil {
+		return Block{}, err
+	}
+	req.Header.Set("Accept-Encoding", compressionZstd)
+	resp, err := remoteHTTP.Do(req)
 	if err != nil {
 		return Block{}, err
 	}
@@ -837,13 +897,22 @@ func fetchRemotePart(meta PartMeta) (Block, error) {
 		_ = resp.Body.Close()
 		return Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
 	}
+	r, _, err := openBlockReader(resp.Body)
+	if err != nil {
+		_ = resp.Body.Close()
+		return Block{}, err
+	}
 	var b Block
-	decodeErr := json.NewDecoder(resp.Body).Decode(&b)
-	closeErr := resp.Body.Close()
+	decodeErr := json.NewDecoder(r).Decode(&b)
+	rCloseErr := r.Close()
+	bodyCloseErr := resp.Body.Close()
 	if decodeErr != nil {
 		return Block{}, decodeErr
 	}
-	return b, closeErr
+	if rCloseErr != nil {
+		return Block{}, rCloseErr
+	}
+	return b, bodyCloseErr
 }
 
 func newPartID(nodeID string) string {

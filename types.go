@@ -32,6 +32,7 @@ type PartMeta struct {
 	Count        int      `json:"count"`
 	Addr         string   `json:"addr"`             // host:port of the origin node's HTTP server
 	Tokens       []string `json:"tokens,omitempty"` // token set for text pruning
+	Compression  string   `json:"compression,omitempty"`
 }
 
 func (m PartMeta) overlaps(from, to int64) bool {
@@ -51,11 +52,12 @@ type IndexBlock struct {
 
 // IndexPartMeta describes an immutable index part stored on disk.
 type IndexPartMeta struct {
-	ID        string `json:"id"`
-	NodeID    string `json:"node_id"`
-	Level     int    `json:"level"`
-	MinToken  string `json:"min_token"`
-	MaxToken  string `json:"max_token"`
-	Count     int    `json:"count"`
-	CreatedAt int64  `json:"created_at,omitempty"`
+	ID          string `json:"id"`
+	NodeID      string `json:"node_id"`
+	Level       int    `json:"level"`
+	MinToken    string `json:"min_token"`
+	MaxToken    string `json:"max_token"`
+	Count       int    `json:"count"`
+	CreatedAt   int64  `json:"created_at,omitempty"`
+	Compression string `json:"compression,omitempty"`
 }

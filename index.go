@@ -404,19 +404,20 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	path := filepath.Join(indexDir, id+".json")
 	metaPath := filepath.Join(indexDir, id+".meta")
 
-	if err := writeIndexBlock(path, IndexBlock{Entries: entries}); err != nil {
+	if err := writeIndexBlock(path, IndexBlock{Entries: entries}, compressionZstd); err != nil {
 		e.mem.Write(entries) // restore on failure
 		return fmt.Errorf("write index block: %w", err)
 	}
 
 	meta := IndexPartMeta{
-		ID:        id,
-		NodeID:    e.nodeID,
-		Level:     0,
-		MinToken:  entries[0].Token,
-		MaxToken:  entries[len(entries)-1].Token,
-		Count:     len(entries),
-		CreatedAt: time.Now().UnixNano(),
+		ID:          id,
+		NodeID:      e.nodeID,
+		Level:       0,
+		MinToken:    entries[0].Token,
+		MaxToken:    entries[len(entries)-1].Token,
+		Count:       len(entries),
+		CreatedAt:   time.Now().UnixNano(),
+		Compression: compressionZstd,
 	}
 
 	if err := writeIndexMeta(metaPath, meta); err != nil {
@@ -498,18 +499,19 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		path := filepath.Join(indexDir, id+".json")
 		metaPath := filepath.Join(indexDir, id+".meta")
 
-		if err := writeIndexBlock(path, IndexBlock{Entries: active}); err != nil {
+		if err := writeIndexBlock(path, IndexBlock{Entries: active}, compressionZstd); err != nil {
 			return fmt.Errorf("write compacted index block: %w", err)
 		}
 
 		meta := IndexPartMeta{
-			ID:        id,
-			NodeID:    e.nodeID,
-			Level:     1,
-			MinToken:  active[0].Token,
-			MaxToken:  active[len(active)-1].Token,
-			Count:     len(active),
-			CreatedAt: time.Now().UnixNano(),
+			ID:          id,
+			NodeID:      e.nodeID,
+			Level:       1,
+			MinToken:    active[0].Token,
+			MaxToken:    active[len(active)-1].Token,
+			Count:       len(active),
+			CreatedAt:   time.Now().UnixNano(),
+			Compression: compressionZstd,
 		}
 
 		if err := writeIndexMeta(metaPath, meta); err != nil {
@@ -674,16 +676,29 @@ func writeIndexMeta(path string, meta IndexPartMeta) error {
 	return os.Rename(name, path)
 }
 
-func writeIndexBlock(path string, b IndexBlock) error {
+func writeIndexBlock(path string, b IndexBlock, algo string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-index-")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
-	if err := json.NewEncoder(tmp).Encode(b); err != nil {
+	cw, err := newCompressingWriter(tmp, algo)
+	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(name)
 		return err
+	}
+	encErr := json.NewEncoder(cw).Encode(b)
+	closeErr := cw.Close()
+	if encErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return encErr
+	}
+	if closeErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return closeErr
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -701,10 +716,20 @@ func readIndexBlock(path string) (IndexBlock, error) {
 	if err != nil {
 		return IndexBlock{}, err
 	}
-	defer func() { _ = f.Close() }()
-	var b IndexBlock
-	if err := json.NewDecoder(f).Decode(&b); err != nil {
+	r, _, err := openBlockReader(f)
+	if err != nil {
+		_ = f.Close()
 		return IndexBlock{}, err
 	}
-	return b, nil
+	var b IndexBlock
+	decodeErr := json.NewDecoder(r).Decode(&b)
+	rCloseErr := r.Close()
+	fCloseErr := f.Close()
+	if decodeErr != nil {
+		return IndexBlock{}, decodeErr
+	}
+	if rCloseErr != nil {
+		return IndexBlock{}, rCloseErr
+	}
+	return b, fCloseErr
 }

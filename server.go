@@ -258,12 +258,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePart(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	// Set Content-Type before writing; http.Error will override it on failure
 	// (safe because os.Open failure occurs before any bytes are written to w).
 	w.Header().Set("Content-Type", "application/json")
-	if err := s.lsm.ServeLocalPart(id, w); err != nil {
-		http.Error(w, "part not found: "+id, http.StatusNotFound)
+	if err := s.lsm.ServeLocalPart(r, w); err != nil {
+		http.Error(w, "part not found: "+r.PathValue("id"), http.StatusNotFound)
 	}
 }
 
