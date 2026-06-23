@@ -208,8 +208,14 @@ func (l *LSM) startup(ctx context.Context) error {
 	// (so LogCleanup won't drop logs we might still conceptually need during transition).
 	var loaded []PartMeta
 	for id, meta := range snap.Parts {
-		if _, err := os.Stat(l.partMetaPath(id)); err == nil {
-			loaded = append(loaded, meta)
+		metaPath := l.partMetaPath(id)
+		if _, err := os.Stat(metaPath); err == nil {
+			// Prefer disk meta — it retains tokens stripped from etcd.
+			if diskMeta, err := readMeta(metaPath); err == nil {
+				loaded = append(loaded, diskMeta)
+			} else {
+				loaded = append(loaded, meta)
+			}
 			continue
 		}
 		raw, _, err := fetchRemotePart(meta)
@@ -357,8 +363,14 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 	}
 	var loaded []PartMeta
 	for id, meta := range snap.Parts {
-		if _, err := os.Stat(l.partMetaPath(id)); err == nil {
-			loaded = append(loaded, meta)
+		metaPath := l.partMetaPath(id)
+		if _, err := os.Stat(metaPath); err == nil {
+			// Prefer disk meta — it retains tokens stripped from etcd.
+			if diskMeta, err := readMeta(metaPath); err == nil {
+				loaded = append(loaded, diskMeta)
+			} else {
+				loaded = append(loaded, meta)
+			}
 			continue
 		}
 		raw, _, err := fetchRemotePart(meta)
@@ -630,7 +642,6 @@ func (l *LSM) maxPartLevel() int {
 
 // compactLevel merges all parts at the given level into one part at level+1.
 func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
-
 	l.mu.RLock()
 	var levelParts []PartMeta
 	for _, p := range l.parts {
@@ -1017,6 +1028,20 @@ func writeBlock(path string, b Block, algo string) error {
 		return err
 	}
 	return os.Rename(name, path)
+}
+
+// readMeta reads PartMeta from a .meta file on disk.
+func readMeta(path string) (PartMeta, error) {
+	f, err := os.Open(path) // #nosec G304 -- trusted internal part path
+	if err != nil {
+		return PartMeta{}, err
+	}
+	defer func() { _ = f.Close() }()
+	var meta PartMeta
+	if err := json.NewDecoder(f).Decode(&meta); err != nil {
+		return PartMeta{}, err
+	}
+	return meta, nil
 }
 
 // writeMeta writes meta to path atomically via a temp-file + rename.
