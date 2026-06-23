@@ -275,7 +275,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func startEtcd(ctx context.Context, t *testing.T) string {
+func startEtcd(ctx context.Context, t testing.TB) string {
 	t.Helper()
 	sharedEtcdOnce.Do(func() {
 		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -309,7 +309,7 @@ func startEtcd(ctx context.Context, t *testing.T) string {
 	return sharedEtcdEndpoint
 }
 
-func clearEtcd(ctx context.Context, t *testing.T, endpoint string) {
+func clearEtcd(ctx context.Context, t testing.TB, endpoint string) {
 	t.Helper()
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{endpoint},
@@ -321,7 +321,7 @@ func clearEtcd(ctx context.Context, t *testing.T, endpoint string) {
 	require.NoError(t, err)
 }
 
-func waitEtcd(ctx context.Context, t *testing.T, cli *clientv3.Client) {
+func waitEtcd(ctx context.Context, t testing.TB, cli *clientv3.Client) {
 	t.Helper()
 	for {
 		_, err := cli.Status(ctx, cli.Endpoints()[0])
@@ -336,7 +336,7 @@ func waitEtcd(ctx context.Context, t *testing.T, cli *clientv3.Client) {
 	}
 }
 
-func freeLocalAddr(t *testing.T) string {
+func freeLocalAddr(t testing.TB) string {
 	t.Helper()
 	must := require.New(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -346,7 +346,7 @@ func freeLocalAddr(t *testing.T) string {
 	return addr
 }
 
-func waitHTTP(ctx context.Context, t *testing.T, url string) {
+func waitHTTP(ctx context.Context, t testing.TB, url string) {
 	t.Helper()
 	must := require.New(t)
 	for {
@@ -367,7 +367,7 @@ func waitHTTP(ctx context.Context, t *testing.T, url string) {
 	}
 }
 
-func postJSON(ctx context.Context, t *testing.T, url string, v any) {
+func postJSON(ctx context.Context, t testing.TB, url string, v any) {
 	t.Helper()
 	must := require.New(t)
 	body, err := json.Marshal(v)
@@ -381,7 +381,7 @@ func postJSON(ctx context.Context, t *testing.T, url string, v any) {
 	must.Equal(http.StatusNoContent, resp.StatusCode, "POST %s: %s", url, resp.Status)
 }
 
-func getJSON(ctx context.Context, t *testing.T, url string, v any) {
+func getJSON(ctx context.Context, t testing.TB, url string, v any) {
 	t.Helper()
 	must := require.New(t)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
