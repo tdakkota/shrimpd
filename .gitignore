@@ -19,9 +19,12 @@ secret.yaml
 
 /shrimpd
 /example/nodes
+/rnd
+
+old.txt
+new.txt
 
 # goreleaser
 dist
 coverage.txt
 .task
-
