@@ -3,6 +3,7 @@ package shrimpd
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/maypok86/otter"
 )
 
 const (
@@ -24,6 +27,7 @@ const (
 	flushInterval   = 5 * time.Second // time-based flush regardless of size
 	compactTrigger  = 4               // L0 parts before compaction kicks in
 	compactInterval = 15 * time.Second
+	maxLevel        = 2 // maximum compaction level
 )
 
 var remoteHTTP = &http.Client{Timeout: 10 * time.Second}
@@ -43,6 +47,19 @@ type LSM struct {
 	parts []PartMeta // all parts replicated locally, kept in sync with etcd log
 
 	idxEngine *IndexEngine // Separate Index Engine
+
+	rowBlockCache otter.Cache[rowCacheKey, *RowBlock] // keyed by (partID, block index)
+	sparseCache   otter.Cache[string, []SparseEntry]  // keyed by partID, for legacy parts
+	partMgr       *PartManager                         // manages open V2 part files
+}
+
+// Close releases resources held by the LSM without flushing. It is intended for
+// tests and benchmarks that drive the LSM directly without calling Run.
+func (l *LSM) Close() error {
+	l.partMgr.Close()
+	l.sparseCache.Close()
+	l.rowBlockCache.Close()
+	return l.idxEngine.Close()
 }
 
 // NewLSM creates an LSM instance and replays unflushed entries from the WAL.
@@ -52,15 +69,34 @@ func NewLSM(nodeID, addr, dataDir string, wal *WAL, reg *Registry) (*LSM, error)
 		return nil, fmt.Errorf("new index engine: %w", err)
 	}
 
+	rowBlockCache, _ := otter.MustBuilder[rowCacheKey, *RowBlock](1<<16).
+		Cost(func(_ rowCacheKey, rb *RowBlock) uint32 {
+			n := 0
+			for i := range rb.Timestamps {
+				n += 8 + len(rb.Data[i])
+			}
+			return uint32(n)
+		}).
+		Build()
+
+	sparseCache, _ := otter.MustBuilder[string, []SparseEntry](1<<12).
+		Cost(func(_ string, s []SparseEntry) uint32 {
+			return uint32(len(s) * 12)
+		}).
+		Build()
+
 	l := &LSM{
-		nodeID:    nodeID,
-		addr:      addr,
-		dataDir:   dataDir,
-		mem:       &MemTable{},
-		wal:       wal,
-		reg:       reg,
-		flushSig:  make(chan struct{}, 1),
-		idxEngine: idx,
+		nodeID:        nodeID,
+		addr:          addr,
+		dataDir:       dataDir,
+		mem:           &MemTable{},
+		wal:           wal,
+		reg:           reg,
+		flushSig:      make(chan struct{}, 1),
+		idxEngine:     idx,
+		rowBlockCache: rowBlockCache,
+		sparseCache:   sparseCache,
+		partMgr:       NewPartManager(dataDir),
 	}
 	// Replay WAL to recover any entries not yet flushed to a part.
 	entries, err := wal.Recover()
@@ -121,6 +157,9 @@ func (l *LSM) Run(ctx context.Context) error {
 			if l.mem.Len() > 0 {
 				_ = l.flush(context.Background())
 			}
+			l.partMgr.Close()
+			l.sparseCache.Close()
+			l.rowBlockCache.Close()
 			_ = l.idxEngine.Close()
 			return ctx.Err()
 		case <-l.flushSig:
@@ -146,9 +185,8 @@ func (l *LSM) Run(ctx context.Context) error {
 			if err := l.compact(ctx, false); err != nil {
 				slog.ErrorContext(ctx, "compact failed", "error", err)
 			}
-			// Trigger index compaction with active data part IDs
 			l.mu.RLock()
-			activeIDs := make(map[string]struct{})
+			activeIDs := make(map[string]struct{}, len(l.parts))
 			for _, p := range l.parts {
 				activeIDs[p.ID] = struct{}{}
 			}
@@ -179,14 +217,14 @@ func (l *LSM) startup(ctx context.Context) error {
 			loaded = append(loaded, meta)
 			continue
 		}
-		block, err := fetchRemotePart(meta)
+		raw, _, err := fetchRemotePart(meta)
 		if err != nil {
 			return fmt.Errorf("bootstrap fetch %s: %w", id, err)
 		}
-		if err := writeBlock(l.partPath(id), block, compressionZstd); err != nil {
+		if err := writeRawPart(l.partPath(id), raw); err != nil {
 			return err
 		}
-		meta.Compression = compressionZstd
+		meta.Compression = detectAlgo(raw)
 		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return err
@@ -207,7 +245,7 @@ func (l *LSM) startup(ctx context.Context) error {
 	// Repair missing local sidecars (L1 sparse index).
 	for _, p := range l.parts {
 		if _, err := readSidecar(l.sidecarPath(p.ID)); os.IsNotExist(err) {
-			if b, err := l.readLocalPart(p.ID); err == nil {
+			if b, err := l.readPartBlock(p); err == nil {
 				if err := writeSidecar(l.sidecarPath(p.ID), buildSparse(b.Data, 32)); err != nil {
 					slog.WarnContext(ctx, "repair sidecar failed", "id", p.ID, "error", err)
 				}
@@ -223,7 +261,7 @@ func (l *LSM) startup(ctx context.Context) error {
 		_, covered := l.idxEngine.covered[p.ID]
 		l.idxEngine.mu.RUnlock()
 		if !covered {
-			block, err := l.readLocalPart(p.ID)
+			block, err := l.readPartBlock(p)
 			if err != nil {
 				slog.WarnContext(ctx, "startup index reconciliation: read part failed", "id", p.ID, "error", err)
 				continue
@@ -328,14 +366,14 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 			loaded = append(loaded, meta)
 			continue
 		}
-		block, err := fetchRemotePart(meta)
+		raw, _, err := fetchRemotePart(meta)
 		if err != nil {
 			return fmt.Errorf("bootstrap fetch failed: %w", err)
 		}
-		if err := writeBlock(l.partPath(id), block, compressionZstd); err != nil {
-			return fmt.Errorf("write block: %w", err)
+		if err := writeRawPart(l.partPath(id), raw); err != nil {
+			return fmt.Errorf("write part: %w", err)
 		}
-		meta.Compression = compressionZstd
+		meta.Compression = detectAlgo(raw)
 		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return fmt.Errorf("write meta: %w", err)
@@ -352,7 +390,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 		_, covered := l.idxEngine.covered[p.ID]
 		l.idxEngine.mu.RUnlock()
 		if !covered {
-			block, err := l.readLocalPart(p.ID)
+			block, err := l.readPartBlock(p)
 			if err != nil {
 				slog.WarnContext(ctx, "bootstrap index reconciliation: read part failed", "id", p.ID, "error", err)
 				continue
@@ -379,7 +417,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 	switch entry.Op {
 	case OpPut:
 		slog.InfoContext(ctx, "replicating PUT part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		block, err := fetchRemotePart(entry.Part)
+		raw, block, err := fetchRemotePart(entry.Part)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -387,10 +425,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		path := l.partPath(entry.Part.ID)
 		metaPath := l.partMetaPath(entry.Part.ID)
 
-		if err := writeBlock(path, block, compressionZstd); err != nil {
-			return fmt.Errorf("write block: %w", err)
+		if err := writeRawPart(path, raw); err != nil {
+			return fmt.Errorf("write part: %w", err)
 		}
-		entry.Part.Compression = compressionZstd
+		entry.Part.Compression = detectAlgo(raw)
 		if err := writeMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -415,7 +453,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 
 	case OpMerge:
 		slog.InfoContext(ctx, "replicating MERGE part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		block, err := fetchRemotePart(entry.Part)
+		raw, block, err := fetchRemotePart(entry.Part)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -423,10 +461,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 		path := l.partPath(entry.Part.ID)
 		metaPath := l.partMetaPath(entry.Part.ID)
 
-		if err := writeBlock(path, block, compressionZstd); err != nil {
-			return fmt.Errorf("write block: %w", err)
+		if err := writeRawPart(path, raw); err != nil {
+			return fmt.Errorf("write part: %w", err)
 		}
-		entry.Part.Compression = compressionZstd
+		entry.Part.Compression = detectAlgo(raw)
 		if err := writeMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -477,33 +515,29 @@ func (l *LSM) flush(ctx context.Context) error {
 	metaPath := l.partMetaPath(id)
 
 	slog.DebugContext(ctx, "creating new part", "id", id, "count", len(entries))
-	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), Data: entries}, compressionZstd); err != nil {
-		l.mem.Write(entries) // restore on failure so next flush retries
-		return fmt.Errorf("write block: %w", err)
-	}
 
-	sparse := buildSparse(entries, 32)
-	if err := writeSidecar(l.sidecarPath(id), sparse); err != nil {
-		_ = os.Remove(path)
-		l.mem.Write(entries)
-		return fmt.Errorf("write sidecar: %w", err)
+	blockHeaders, err := writePartV2(path, entries)
+	if err != nil {
+		l.mem.Write(entries) // restore on failure so next flush retries
+		return fmt.Errorf("write v2 part: %w", err)
 	}
 
 	meta := PartMeta{
-		ID:           id,
-		NodeID:       l.nodeID,
-		Level:        0,
-		MinTimestamp: entries[0].Timestamp,
-		MaxTimestamp: entries[len(entries)-1].Timestamp,
-		Count:        len(entries),
-		Addr:         l.addr,
-		Tokens:       buildTokenSet(entries),
-		Compression:  compressionZstd,
+		ID:            id,
+		NodeID:        l.nodeID,
+		Level:         0,
+		MinTimestamp:  entries[0].Timestamp,
+		MaxTimestamp:  entries[len(entries)-1].Timestamp,
+		Count:         len(entries),
+		Addr:          l.addr,
+		Tokens:        buildTokenSet(entries),
+		Compression:   compressionZstd,
+		FormatVersion: 1,
+		BlockCount:    len(blockHeaders),
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
-		_ = os.Remove(l.sidecarPath(id))
 		l.mem.Write(entries)
 		return fmt.Errorf("write meta: %w", err)
 	}
@@ -511,7 +545,6 @@ func (l *LSM) flush(ctx context.Context) error {
 	if _, err := l.reg.AppendLog(ctx, OpPut, meta, nil); err != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(metaPath)
-		_ = os.Remove(l.sidecarPath(id))
 		l.mem.Write(entries)
 		return fmt.Errorf("append log: %w", err)
 	}
@@ -547,46 +580,105 @@ func (l *LSM) flush(ctx context.Context) error {
 	return nil
 }
 
-// compact merges all L0 parts for this node into a single L1 part.
+// Flush forces an immediate flush of the data memtable and the index memtable.
+func (l *LSM) Flush(ctx context.Context) error {
+	if err := l.flush(ctx); err != nil {
+		return err
+	}
+	return l.idxEngine.Flush(ctx)
+}
+
+// Compact forces compaction of data parts and then compacts the index, removing
+// entries for data part IDs that no longer exist.
+func (l *LSM) Compact(ctx context.Context) error {
+	// Force-compact L0 → L1, but use threshold logic for L1 → L2 so a single
+	// freshly-created L1 part isn't immediately re-merged into L2.
+	if err := l.compactLevel(ctx, 0, true); err != nil {
+		return err
+	}
+	if err := l.compactLevel(ctx, 1, false); err != nil {
+		return err
+	}
+	l.mu.RLock()
+	activeIDs := make(map[string]struct{}, len(l.parts))
+	for _, p := range l.parts {
+		activeIDs[p.ID] = struct{}{}
+	}
+	l.mu.RUnlock()
+	return l.idxEngine.Compact(ctx, activeIDs)
+}
+
+// compact merges all parts from levels 0 and 1 for this node.
 // Emits a MERGE operation to the etcd log.
 func (l *LSM) compact(ctx context.Context, force bool) error {
+	if err := l.compactLevel(ctx, 0, force); err != nil {
+		return err
+	}
+	return l.compactLevel(ctx, 1, force)
+}
+
+// compactLevel merges all parts at the given level into one part at level+1.
+func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
+	if level >= maxLevel {
+		return nil
+	}
+
 	l.mu.RLock()
-	var l0 []PartMeta
+	var levelParts []PartMeta
 	for _, p := range l.parts {
-		if p.Level == 0 && p.NodeID == l.nodeID {
-			l0 = append(l0, p)
+		if p.Level == level && p.NodeID == l.nodeID {
+			levelParts = append(levelParts, p)
 		}
 	}
 	l.mu.RUnlock()
 
-	if !force && len(l0) < compactTrigger {
+	if !force && len(levelParts) < compactTrigger {
 		return nil
 	}
-	if len(l0) == 0 {
+	if len(levelParts) == 0 {
 		if force {
-			slog.DebugContext(ctx, "compaction skipped: no L0 parts to compact")
+			slog.DebugContext(ctx, "compaction skipped: no parts to compact", "level", level)
 		}
 		return nil
 	}
 
 	var merged []Entry
-	for _, meta := range l0 {
-		b, err := l.readLocalPart(meta.ID)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", meta.ID, err)
+	for _, meta := range levelParts {
+		if meta.FormatVersion == 1 {
+			pf, err := l.partMgr.Get(meta.ID, meta)
+			if err != nil {
+				return fmt.Errorf("open v2 %s: %w", meta.ID, err)
+			}
+			if pf == nil {
+				return fmt.Errorf("v2 part not available: %s", meta.ID)
+			}
+			for i := range pf.Headers {
+				rb, err := readRowBlock(pf, i)
+				if err != nil {
+					return fmt.Errorf("read block %s[%d]: %w", meta.ID, i, err)
+				}
+				for j := range rb.Timestamps {
+					merged = append(merged, Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+				}
+			}
+		} else {
+			b, err := l.readLocalPart(meta.ID)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", meta.ID, err)
+			}
+			merged = append(merged, b.Data...)
 		}
-		merged = append(merged, b.Data...)
 	}
 	if len(merged) == 0 {
 		if force {
-			slog.DebugContext(ctx, "compaction skipped: no data in L0 parts")
+			slog.DebugContext(ctx, "compaction skipped: no data in parts", "level", level)
 		}
 		return nil
 	}
 	slices.SortFunc(merged, func(a, b Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
 
-	oldIDs := make([]string, len(l0))
-	for i, p := range l0 {
+	oldIDs := make([]string, len(levelParts))
+	for i, p := range levelParts {
 		oldIDs[i] = p.ID
 	}
 
@@ -594,47 +686,40 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	path := l.partPath(id)
 	metaPath := l.partMetaPath(id)
 
-	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), SourceBlocks: oldIDs, Data: merged}, compressionZstd); err != nil {
-		return err
-	}
-
-	sparse := buildSparse(merged, 32)
-	if err := writeSidecar(l.sidecarPath(id), sparse); err != nil {
-		_ = os.Remove(path)
-		return fmt.Errorf("write sidecar: %w", err)
+	blockHeaders, err := writePartV2(path, merged)
+	if err != nil {
+		return fmt.Errorf("write v2 part: %w", err)
 	}
 
 	meta := PartMeta{
-		ID:           id,
-		NodeID:       l.nodeID,
-		Level:        1,
-		MinTimestamp: merged[0].Timestamp,
-		MaxTimestamp: merged[len(merged)-1].Timestamp,
-		Count:        len(merged),
-		Addr:         l.addr,
-		Tokens:       buildTokenSet(merged),
-		Compression:  compressionZstd,
+		ID:            id,
+		NodeID:        l.nodeID,
+		Level:         level + 1,
+		MinTimestamp:  merged[0].Timestamp,
+		MaxTimestamp:  merged[len(merged)-1].Timestamp,
+		Count:         len(merged),
+		Addr:          l.addr,
+		Tokens:        buildTokenSet(merged),
+		Compression:   compressionZstd,
+		FormatVersion: 1,
+		BlockCount:    len(blockHeaders),
 	}
 
 	if err := writeMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
-		_ = os.Remove(l.sidecarPath(id))
 		return fmt.Errorf("write meta: %w", err)
 	}
 
-	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "count", len(merged))
+	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "level", level, "new_level", level+1, "count", len(merged))
 
 	if _, err := l.reg.AppendLog(ctx, OpMerge, meta, oldIDs); err != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(metaPath)
-		_ = os.Remove(l.sidecarPath(id))
 		return fmt.Errorf("append log: %w", err)
 	}
 
-	// Defer deletions to runGC (5m safety cutoff) to prevent 404s during peer replication.
-
-	oldSet := make(map[string]bool, len(l0))
-	for _, p := range l0 {
+	oldSet := make(map[string]bool, len(levelParts))
+	for _, p := range levelParts {
 		oldSet[p.ID] = true
 	}
 	l.mu.Lock()
@@ -663,7 +748,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		}
 	}
 
-	slog.InfoContext(ctx, "compacted parts", "level0_count", len(l0), "id", id, "level", 1, "count", len(merged))
+	slog.InfoContext(ctx, "compacted parts", "level", level, "count", len(levelParts), "id", id, "new_level", level+1, "entry_count", len(merged))
 	return nil
 }
 
@@ -698,14 +783,14 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 
 	var (
 		result = make([]Entry, 0)
-		// TODO(tdakkota): consider caching sparse indexes in memory for faster queries
-		sidecarCache = make(map[string][]SparseEntry) // cache sparse index for each part
-		getSparse    = func(id string) []SparseEntry {
-			if s, ok := sidecarCache[id]; ok {
+		getSparse = func(id string) []SparseEntry {
+			if s, ok := l.sparseCache.Get(id); ok {
 				return s
 			}
 			s, _ := readSidecar(l.sidecarPath(id))
-			sidecarCache[id] = s
+			if s != nil {
+				l.sparseCache.Set(id, s)
+			}
 			return s
 		}
 	)
@@ -715,18 +800,57 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 				continue
 			}
 		} else {
-			// Fallback: use legacy PartMeta.Tokens pruning if available
 			if normalizedTerm != "" && !hasToken(meta.Tokens, normalizedTerm) {
 				continue
 			}
 		}
 
+		// Try V2 path first
+		if meta.FormatVersion == 1 {
+			pf, err := l.partMgr.Get(meta.ID, meta)
+			if err != nil {
+				return nil, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
+			}
+			if pf == nil {
+				return nil, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
+			}
+			for i, hdr := range pf.Headers {
+				if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
+					continue
+				}
+				if normalizedTerm != "" && !bloomMightContain(&hdr.Bloom, normalizedTerm) {
+					continue
+				}
+
+				ck := rowCacheKey{PartID: meta.ID, Block: i}
+				rb, ok := l.rowBlockCache.Get(ck)
+				if !ok {
+					var err error
+					rb, err = readRowBlock(pf, i)
+					if err != nil {
+						slog.WarnContext(ctx, "read row block", "id", meta.ID, "block", i, "error", err)
+						continue
+					}
+					l.rowBlockCache.Set(ck, rb)
+				}
+
+				for j := range rb.Timestamps {
+					e := Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
+					if e.Matches(from, to, normalizedTerm) {
+						result = append(result, e)
+					}
+				}
+			}
+			continue
+		}
+
+		// Legacy path
 		block, err := l.readLocalPart(meta.ID)
 		if err != nil {
 			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
 			continue
 		}
-		sparse := getSparse(l.sidecarPath(meta.ID))
+		sparse := getSparse(meta.ID)
 		lo, hi := sparseRange(sparse, from, to)
 		if lo < 0 {
 			lo = 0
@@ -836,6 +960,21 @@ func (l *LSM) readLocalPart(id string) (Block, error) {
 	return b, fCloseErr
 }
 
+// readPartBlock reads any local part (V2 binary or legacy JSON) and returns a Block.
+func (l *LSM) readPartBlock(meta PartMeta) (Block, error) {
+	if meta.FormatVersion == 1 {
+		pf, err := l.partMgr.Get(meta.ID, meta)
+		if err != nil {
+			return Block{}, err
+		}
+		if pf == nil {
+			return Block{}, fmt.Errorf("v2 part not found: %s", meta.ID)
+		}
+		return v2ToBlock(pf)
+	}
+	return l.readLocalPart(meta.ID)
+}
+
 // writeBlock writes b to path atomically via a temp-file + rename.
 func writeBlock(path string, b Block, algo string) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
@@ -895,36 +1034,93 @@ func writeMeta(path string, meta PartMeta) error {
 	return os.Rename(name, path)
 }
 
-func fetchRemotePart(meta PartMeta) (Block, error) {
+// fetchRemotePart downloads a part from its source node.
+// It returns the raw bytes (to be written to disk verbatim) and the decoded
+// Block (for indexing). Writing raw bytes preserves the on-disk format
+// (V2 binary or compressed JSON) so that PartManager can open it correctly.
+func fetchRemotePart(meta PartMeta) (raw []byte, block Block, err error) {
 	req, err := http.NewRequest(http.MethodGet, "http://"+meta.Addr+"/part/"+meta.ID, http.NoBody)
 	if err != nil {
-		return Block{}, err
+		return nil, Block{}, err
 	}
 	req.Header.Set("Accept-Encoding", compressionZstd)
 	resp, err := remoteHTTP.Do(req)
 	if err != nil {
-		return Block{}, err
+		return nil, Block{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		return Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
+		return nil, Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
 	}
-	r, _, err := openBlockReader(resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
-		return Block{}, err
+		return nil, Block{}, fmt.Errorf("read body: %w", err)
+	}
+	_ = resp.Body.Close()
+
+	// V2 binary format: write raw bytes verbatim so PartManager can open them.
+	if len(body) >= 4 && string(body[:4]) == magicShrimp {
+		tmpDir, _ := os.MkdirTemp("", "shrimpd-fetch-*")
+		tmpPath := filepath.Join(tmpDir, meta.ID+".json")
+		if err := os.WriteFile(tmpPath, body, 0o644); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, Block{}, fmt.Errorf("write tmp v2: %w", err)
+		}
+		pf, err := openPartV2(tmpPath, meta)
+		if err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, Block{}, fmt.Errorf("open v2: %w", err)
+		}
+		if pf == nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, Block{}, fmt.Errorf("invalid v2 magic: %s", meta.ID)
+		}
+		b, err := v2ToBlock(pf)
+		_ = pf.Close()
+		_ = os.RemoveAll(tmpDir)
+		if err != nil {
+			return nil, Block{}, fmt.Errorf("v2 to block: %w", err)
+		}
+		return body, b, nil
+	}
+
+	r, _, err := openBlockReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, Block{}, err
 	}
 	var b Block
 	decodeErr := json.NewDecoder(r).Decode(&b)
 	rCloseErr := r.Close()
-	bodyCloseErr := resp.Body.Close()
 	if decodeErr != nil {
-		return Block{}, decodeErr
+		return nil, Block{}, decodeErr
 	}
 	if rCloseErr != nil {
-		return Block{}, rCloseErr
+		return nil, Block{}, rCloseErr
 	}
-	return b, bodyCloseErr
+	return body, b, nil
+}
+
+// writeRawPart writes raw part bytes to path atomically via a temp-file rename,
+// preserving whatever on-disk format (V2 binary or compressed JSON) was fetched.
+func writeRawPart(path string, raw []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, writeErr := tmp.Write(raw)
+	closeErr := tmp.Close()
+	if writeErr != nil {
+		_ = os.Remove(name)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(name)
+		return closeErr
+	}
+	return os.Rename(name, path)
 }
 
 func newPartID(nodeID string) string {
@@ -994,6 +1190,11 @@ func (l *LSM) runGC(ctx context.Context) error {
 		}
 	}
 
+	// Evict deleted parts from caches
+	for id := range active {
+		_ = id // parts still active, keep in cache
+	}
+
 	// Safely reconcile local l.parts without dropping recently flushed parts
 	l.mu.Lock()
 	var reconciled []PartMeta
@@ -1004,6 +1205,9 @@ func (l *LSM) runGC(ctx context.Context) error {
 			info, err := os.Stat(l.partMetaPath(p.ID))
 			if err == nil && info.ModTime().After(cutoff) {
 				reconciled = append(reconciled, p)
+			} else {
+				// Part is being evicted: clean up caches and close fd
+				l.evictPart(p.ID)
 			}
 		}
 	}
@@ -1011,4 +1215,13 @@ func (l *LSM) runGC(ctx context.Context) error {
 	l.mu.Unlock()
 
 	return nil
+}
+
+// evictPart cleans up cached resources for the given part ID.
+func (l *LSM) evictPart(id string) {
+	l.rowBlockCache.DeleteByFunc(func(k rowCacheKey, _ *RowBlock) bool {
+		return k.PartID == id
+	})
+	l.sparseCache.Delete(id)
+	l.partMgr.Release(id)
 }

@@ -49,10 +49,35 @@ type PartMeta struct {
 	Addr         string   `json:"addr"`             // host:port of the origin node's HTTP server
 	Tokens       []string `json:"tokens,omitempty"` // token set for text pruning
 	Compression  string   `json:"compression,omitempty"`
+	// FormatVersion is 0 for legacy JSON parts, 1 for v2 binary parts.
+	FormatVersion int `json:"fmt,omitempty"`
+	BlockCount    int `json:"blocks,omitempty"`
 }
 
 func (m PartMeta) overlaps(from, to int64) bool {
 	return m.MaxTimestamp >= from && m.MinTimestamp <= to
+}
+
+// BlockHeader is the in-memory descriptor for one block within a v2 part file.
+type BlockHeader struct {
+	Offset       int64 // byte offset in the part file (for ReadAt)
+	CompressedSz int64 // exact byte count to read
+	Count        int32 // number of rows in this block
+	MinTimestamp int64
+	MaxTimestamp int64
+	Bloom        [1024]byte // 8192-bit blocked bloom filter, k=4
+}
+
+// RowBlock is the decoded content of one block.
+type RowBlock struct {
+	Timestamps []int64  // sorted, parallel to Data
+	Data       []string
+}
+
+// rowCacheKey is the cache key for RowBlock caching.
+type rowCacheKey struct {
+	PartID string
+	Block  int
 }
 
 // IndexEntry represents a mapping from a token to a data part ID.

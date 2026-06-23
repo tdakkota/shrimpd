@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/maypok86/otter"
 )
 
 func tokenize(s string) iter.Seq[string] {
@@ -194,6 +196,8 @@ type IndexEngine struct {
 	mu       sync.RWMutex
 	parts    []IndexPartMeta
 	covered  map[string]struct{}
+
+	idxBlockCache otter.Cache[string, IndexBlock] // keyed by absolute path
 }
 
 // NewIndexEngine initializes the IndexEngine, recovers WAL, and loads metadata.
@@ -207,12 +211,23 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 	if err != nil {
 		return nil, err
 	}
+	idxBlockCache, _ := otter.MustBuilder[string, IndexBlock](1<<16).
+		Cost(func(_ string, b IndexBlock) uint32 {
+			n := 0
+			for _, e := range b.Entries {
+				n += len(e.Token) + len(e.DataID)
+			}
+			return uint32(n)
+		}).
+		Build()
+
 	engine := &IndexEngine{
-		nodeID:   nodeID,
-		dataDir:  dataDir,
-		mem:      &IndexMemTable{},
-		wal:      wal,
-		flushSig: make(chan struct{}, 1),
+		nodeID:        nodeID,
+		dataDir:       dataDir,
+		mem:           &IndexMemTable{},
+		wal:           wal,
+		flushSig:      make(chan struct{}, 1),
+		idxBlockCache: idxBlockCache,
 	}
 
 	// Recover unflushed index entries from WAL
@@ -525,9 +540,11 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 
 	e.parts = next
 
-	// Clean up files
+	// Clean up files and evict cache entries
 	for _, p := range l0 {
-		_ = os.Remove(filepath.Join(e.dataDir, "index", p.ID+".json"))
+		blockPath := filepath.Join(e.dataDir, "index", p.ID+".json")
+		e.idxBlockCache.Delete(blockPath)
+		_ = os.Remove(blockPath)
 		_ = os.Remove(filepath.Join(e.dataDir, "index", p.ID+".meta"))
 	}
 
@@ -589,10 +606,15 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 			}
 
 			blockPath := filepath.Join(e.dataDir, "index", part.ID+".json")
-			block, err := readIndexBlock(blockPath)
-			if err != nil {
-				slog.WarnContext(ctx, "failed to read index block", "path", blockPath, "error", err)
-				return nil, false, err
+			block, ok := e.idxBlockCache.Get(blockPath)
+			if !ok {
+				var err error
+				block, err = readIndexBlock(blockPath)
+				if err != nil {
+					slog.WarnContext(ctx, "failed to read index block", "path", blockPath, "error", err)
+					return nil, false, err
+				}
+				e.idxBlockCache.Set(blockPath, block)
 			}
 
 			idx, found := slices.BinarySearchFunc(block.Entries, tok, func(entry IndexEntry, target string) int {

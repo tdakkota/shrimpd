@@ -33,7 +33,8 @@ func NewServer(addr string, lsm *LSM) *Server {
 	// GET  /query?from=&to= same as /read, kept as a debug-friendly alias
 	// GET  /part/{id}       raw part JSON (served to peer nodes)
 	// GET  /parts           global part list from etcd (debugging)
-	// POST /compact         forces immediate compaction of L0 parts
+	// POST /flush           forces immediate flush of memtable and index memtable
+	// POST /compact         forces immediate compaction of data and index parts
 	mux.HandleFunc("POST /ingest", s.handleIngest)
 	mux.HandleFunc("POST /ingest/otlp", s.handleIngestOTLP)
 	mux.HandleFunc("POST /v1/logs", s.handleIngestOTLP)
@@ -41,6 +42,7 @@ func NewServer(addr string, lsm *LSM) *Server {
 	mux.HandleFunc("GET /query", s.handleQuery)
 	mux.HandleFunc("GET /part/{id}", s.handlePart)
 	mux.HandleFunc("GET /parts", s.handleParts)
+	mux.HandleFunc("POST /flush", s.handleFlush)
 	mux.HandleFunc("POST /compact", s.handleCompact)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -278,8 +280,16 @@ func (s *Server) handleParts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleFlush(w http.ResponseWriter, r *http.Request) {
+	if err := s.lsm.Flush(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
-	if err := s.lsm.compact(r.Context(), true); err != nil {
+	if err := s.lsm.Compact(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
