@@ -2,15 +2,24 @@ package shrimpapi
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/go-faster/jx"
 	"github.com/stretchr/testify/require"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/tdakkota/shrimpd/internal/shrimpwal"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 )
@@ -173,6 +182,50 @@ func TestWriteOTLPLogRecordJSON(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "logger", scopeObj["name"])
 	require.Equal(t, "1.2.3", scopeObj["version"])
+}
+
+func TestHandleQuery_Gzip(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "parts"), 0o755))
+	wal, err := shrimpwal.OpenWAL(filepath.Join(dir, "wal.jsonl"))
+	require.NoError(t, err)
+	defer wal.Close()
+
+	lsm, err := shrimplication.NewLSM("n1", "127.0.0.1:0", dir, wal, shrimplication.NewRegistry(nil, "n1"))
+	require.NoError(t, err)
+	defer lsm.Close()
+
+	require.NoError(t, lsm.Write(context.Background(), []shrimptypes.Entry{
+		{Timestamp: 1, Data: "hello"},
+		{Timestamp: 2, Data: "world"},
+	}))
+
+	srv := NewServer("127.0.0.1:0", lsm)
+	httpSrv := httptest.NewServer(srv.srv.Handler)
+	defer httpSrv.Close()
+
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/query?term=hello", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+
+	zr, err := gzip.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer zr.Close()
+
+	body, err := io.ReadAll(zr)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Contains(t, got, "data")
+	require.Equal(t, []any{map[string]any{"timestamp": float64(1), "data": "hello"}}, got["data"])
 }
 
 func BenchmarkDecodeIngestEntries(b *testing.B) {

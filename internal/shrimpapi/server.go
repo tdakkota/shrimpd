@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CAFxX/httpcompression"
 	"github.com/go-faster/jx"
 	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimplication"
@@ -53,10 +54,15 @@ func NewServer(addr string, lsm *shrimplication.LSM) *Server {
 	mux.HandleFunc("POST /flush", s.handleFlush)
 	mux.HandleFunc("POST /compact", s.handleCompact)
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slog.InfoContext(r.Context(), "incoming request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
+	wrapper, err := httpcompression.DefaultAdapter(httpcompression.MinSize(1024 * 1024))
+	if err != nil {
+		panic(err)
+	}
+	handler = wrapper(handler)
 
 	s.srv = &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	return s
