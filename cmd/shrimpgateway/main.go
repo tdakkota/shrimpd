@@ -19,26 +19,29 @@ func main() {
 	)
 	flag.Parse()
 
+	lg := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(lg)
+
 	targets, err := parseUpstreams(*upstreams)
 	if err != nil {
-		slog.Error("parse upstreams", "error", err)
+		lg.Error("parse upstreams", "error", err)
 		os.Exit(1)
 	}
 	if len(targets) == 0 {
-		slog.Error("no upstreams configured")
+		lg.Error("no upstreams configured")
 		os.Exit(1)
 	}
 
-	proxy := newGateway(targets)
+	proxy := newGateway(targets, lg)
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           proxy,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	slog.Info("gateway listening", "addr", *addr, "upstreams", len(targets))
+	lg.Info("gateway listening", "addr", *addr, "upstreams", len(targets))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		slog.Error("gateway exit", "error", err)
+		lg.Error("gateway exit", "error", err)
 		os.Exit(1)
 	}
 }
@@ -60,18 +63,53 @@ func parseUpstreams(raw string) ([]*url.URL, error) {
 	return targets, nil
 }
 
-func newGateway(targets []*url.URL) http.Handler {
+func newGateway(targets []*url.URL, logger *slog.Logger) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	var next uint32
+	var next atomic.Uint32
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target := targets[(atomic.AddUint32(&next, 1)-1)%uint32(len(targets))]
+		start := time.Now()
+		lw := &loggingResponseWriter{ResponseWriter: w}
+
+		target := targets[(next.Add(1)-1)%uint32(len(targets))]
+		requestLogger := logger.With(
+			"method", r.Method,
+			"path", r.URL.Path,
+			"content_length", r.ContentLength,
+			"upstream", target.String(),
+		)
+
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = transport
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			slog.Warn("gateway upstream error", "method", r.Method, "path", r.URL.Path, "upstream", target.String(), "error", err)
+		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+			requestLogger.Warn("gateway upstream error", "error", err)
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		}
-		proxy.ServeHTTP(w, r)
+		proxy.ServeHTTP(lw, r)
+		requestLogger.Info("gateway request",
+			"status", lw.status,
+			"response_length", lw.bytes,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
 	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *loggingResponseWriter) WriteHeader(statusCode int) {
+	w.status = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += int64(n)
+	return n, err
 }

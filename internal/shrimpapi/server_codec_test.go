@@ -206,7 +206,7 @@ func TestHandleQuery_Gzip(t *testing.T) {
 	defer httpSrv.Close()
 
 	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
-	req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/query?term=hello", nil)
+	req, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/query?term=hello", http.NoBody)
 	require.NoError(t, err)
 	req.Header.Set("Accept-Encoding", "gzip")
 
