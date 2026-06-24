@@ -107,6 +107,10 @@ func WritePartV2(path string, entries []shrimptypes.Entry) ([]shrimptypes.BlockH
 			for tok := range Tokenize(e.Data) {
 				BloomAdd(&bloom, tok)
 			}
+			labels := shrimpfilter.ExtractLabels(e.Data)
+			for k, v := range labels {
+				BloomAddLabel(&bloom, k, v)
+			}
 		}
 
 		headers[bi] = shrimptypes.BlockHeader{

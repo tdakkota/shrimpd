@@ -191,6 +191,15 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.Equal("test-scope", entryObj.Scope.Name)
 		must.Equal("hello from OTLP JSON", entryObj.Body)
 
+		// Force flush so data is on disk as a part with a bloom filter
+		flushReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/flush", http.NoBody)
+		must.NoError(err)
+		flushResp, err := http.DefaultClient.Do(flushReq)
+		must.NoError(err)
+		must.Equal(http.StatusOK, flushResp.StatusCode)
+		flushResp.Body.Close()
+		time.Sleep(100 * time.Millisecond) // wait for async flush + index write
+
 		// Simple term queries exercise tokenization + token index pruning.
 		var qHello shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=hello", &qHello)
@@ -213,6 +222,9 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		getJSON(ctx, t, qLabelEq, &qLE)
 		must.Len(qLE.Data, 1)
 		must.NotNil(qLE.Stats)
+		// Verify blocks were scanned (label bloom hit)
+		must.Greater(qLE.Stats.BlocksScanned, 0,
+			"expected blocks scanned for matching label query, got stats=%+v", qLE.Stats)
 
 		qLabelRe := baseURL + "/query?from=1719080000000000000&to=1719080000000000000&q=" + url.QueryEscape(`{"labels":[{"l":"level","op":"re","v":"IN.*"}]}`)
 		var qLR shrimptypes.Block
@@ -228,6 +240,11 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		var qNM shrimptypes.Block
 		getJSON(ctx, t, qNoMatch, &qNM)
 		must.Len(qNM.Data, 0)
+		// Label bloom pruning should have skipped all blocks
+		// (no "lbl:service_name=no-such" token in any block's bloom).
+		must.NotNil(qNM.Stats)
+		must.Greater(qNM.Stats.BlocksPrunedByIndex, 0,
+			"expected label bloom pruning on non-matching label query, got stats=%+v", qNM.Stats)
 	})
 	t.Run("OTLP_Proto", func(t *testing.T) {
 		// Test OTLP Protobuf ingestion

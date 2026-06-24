@@ -2,11 +2,13 @@ package shrimplication
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
@@ -119,4 +121,49 @@ func TestLSM_QueryWithStats_Memtable(t *testing.T) {
 	require.Equal(t, 3, stats.EntriesScanned)
 	require.Equal(t, 2, stats.EntriesMatched)
 	require.GreaterOrEqual(t, stats.DurationMs, int64(0))
+}
+
+func TestQueryMatcherLabelBloomPruning(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "parts"), 0o755))
+
+	// Create entries: first 1024 with svc-a, next 1024 with svc-b
+	totalEntries := 2048
+	entries := make([]shrimptypes.Entry, totalEntries)
+	for i := range totalEntries {
+		svc := "svc-a"
+		if i >= totalEntries/2 {
+			svc = "svc-b"
+		}
+		entries[i] = shrimptypes.Entry{
+			Timestamp: int64(i),
+			Data:      fmt.Sprintf(`{"severity_text":"INFO","body":"msg %d","resource":{"service.name":%q}}`, i, svc),
+		}
+	}
+
+	path := filepath.Join(dir, "parts", "test.json")
+	headers, err := shrimpblock.WritePartV2(path, entries)
+	require.NoError(t, err)
+	require.Len(t, headers, 4) // 2048/512 = 4 blocks
+
+	// Open the part and check bloom filter contents per block
+	pf, err := shrimpblock.OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pf.Close()
+
+	// Blocks 0-1 have only svc-a: bloom must NOT contain svc-b label
+	for i := range 2 {
+		require.False(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-b"),
+			"block %d has svc-a only, bloom should not contain svc-b label", i)
+		require.True(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-a"),
+			"block %d has svc-a, bloom must contain svc-a label", i)
+	}
+
+	// Blocks 2-3 have only svc-b: bloom must NOT contain svc-a label
+	for _, i := range []int{2, 3} {
+		require.False(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-a"),
+			"block %d has svc-b only, bloom should not contain svc-a label", i)
+		require.True(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-b"),
+			"block %d has svc-b, bloom must contain svc-b label", i)
+	}
 }

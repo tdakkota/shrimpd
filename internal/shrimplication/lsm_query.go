@@ -304,6 +304,19 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 				stats.BlocksPrunedByTS++
 				continue
 			}
+			if !m.Empty() && len(m.Labels) > 0 {
+				pruned := false
+				for _, lf := range m.Labels {
+					if lf.Op == shrimpfilter.OpLabelEq && !shrimpblock.BloomMightContainLabel(&hdr.Bloom, lf.Label, lf.Value) {
+						pruned = true
+						break
+					}
+				}
+				if pruned {
+					stats.BlocksPrunedByIndex++
+					continue
+				}
+			}
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
