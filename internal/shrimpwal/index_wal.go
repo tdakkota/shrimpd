@@ -1,34 +1,28 @@
 package shrimpwal
 
 import (
-	"bufio"
-	"os"
-	"sync"
-
 	"github.com/go-faster/jx"
 )
 
-// IndexWAL is the write-ahead log for pre-flush index entries.
+// IndexWAL is the segmented write-ahead log for pre-flush index entries.
+// It shares the seal/discard segment machinery with WAL; see WAL for the flush
+// protocol and durability invariant.
 type IndexWAL struct {
-	mu sync.Mutex
-	f  *os.File
+	sl *segLog
 }
 
-// OpenIndexWAL opens the local index write-ahead log at path.
+// OpenIndexWAL opens (or creates) the segmented index write-ahead log at path.
+// "<dir>/index-wal.jsonl" yields segments "<dir>/index-wal-NNNNNN.jsonl".
 func OpenIndexWAL(path string) (*IndexWAL, error) {
-	// #nosec G304 -- configured local path
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	sl, err := openSegLog(path)
 	if err != nil {
 		return nil, err
 	}
-	return &IndexWAL{f: f}, nil
+	return &IndexWAL{sl: sl}, nil
 }
 
-// Append writes entries to the IndexWAL and fsyncs before returning.
+// Append writes entries to the active segment and fsyncs before returning.
 func (w *IndexWAL) Append(entries []IndexEntry) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	jw := jx.GetWriter()
 	defer jx.PutWriter(jw)
 
@@ -41,29 +35,24 @@ func (w *IndexWAL) Append(entries []IndexEntry) error {
 		jw.ObjEnd()
 		jw.Buf = append(jw.Buf, '\n')
 	}
-	if _, err := w.f.Write(jw.Buf); err != nil {
-		return err
-	}
-	return w.f.Sync()
+	return w.sl.append(jw.Buf)
 }
 
-// Recover reads all entries from the IndexWAL file. Called once on startup.
+// Seal closes the active segment and opens a fresh one, returning the sealed
+// sequence number for a later Discard.
+func (w *IndexWAL) Seal() (uint64, error) { return w.sl.seal() }
+
+// Discard removes sealed segments with sequence number <= uptoSeq.
+func (w *IndexWAL) Discard(uptoSeq uint64) error { return w.sl.discard(uptoSeq) }
+
+// Recover reads all entries from every segment, oldest first. Called once on
+// startup. Skips corrupt lines silently.
 func (w *IndexWAL) Recover() ([]IndexEntry, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, err := w.f.Seek(0, 0); err != nil {
-		return nil, err
-	}
 	var entries []IndexEntry
-	sc := bufio.NewScanner(w.f)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+	err := w.sl.forEachLine(func(line []byte) {
 		var e IndexEntry
 		d := jx.DecodeBytes(line)
-		if err := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+		if derr := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
 			switch string(key) {
 			case "token":
 				v, err := d.Str()
@@ -81,23 +70,15 @@ func (w *IndexWAL) Recover() ([]IndexEntry, error) {
 				return d.Skip()
 			}
 			return nil
-		}); err == nil {
+		}); derr == nil {
 			entries = append(entries, e)
 		}
+	})
+	if err != nil {
+		return nil, err
 	}
-	return entries, sc.Err()
+	return entries, nil
 }
 
-// Rotate truncates the IndexWAL after a successful flush.
-func (w *IndexWAL) Rotate() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := w.f.Truncate(0); err != nil {
-		return err
-	}
-	_, err := w.f.Seek(0, 0)
-	return err
-}
-
-// Close closes the IndexWAL file.
-func (w *IndexWAL) Close() error { return w.f.Close() }
+// Close closes the active segment file.
+func (w *IndexWAL) Close() error { return w.sl.close() }

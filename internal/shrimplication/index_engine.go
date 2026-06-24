@@ -23,11 +23,17 @@ const indexFlushThreshold = 1000
 
 // IndexEngine is a local-only index table for fast text-token lookup.
 type IndexEngine struct {
-	nodeID   string
-	dataDir  string
-	mem      *IndexMemTable
-	wal      *shrimpwal.IndexWAL
-	writeMu  sync.Mutex // serializes writes with flush rotation boundaries
+	nodeID  string
+	dataDir string
+	mem     *IndexMemTable
+	wal     *shrimpwal.IndexWAL
+	// writeMu makes "snapshot the memtable + seal the WAL" atomic with respect to
+	// concurrent Write. Held only across that brief boundary, never across the
+	// heavy index-block write.
+	writeMu sync.Mutex
+	// flushMu serializes whole flushes against each other (required for the WAL
+	// seal/discard invariant to hold).
+	flushMu  sync.Mutex
 	flushSig chan struct{}
 	mu       sync.RWMutex
 
@@ -209,24 +215,40 @@ func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	return nil
 }
 
-// Flush sorts/deduplicates index memtable and writes an immutable index part.
-// It holds e.mu for the entire duration so a concurrent Lookup never observes a
-// state where the memtable has been snapshotted but the new part is not yet in
-// e.parts (which would cause false negatives while coverage reports complete).
+// Flush sorts/deduplicates the index memtable and writes an immutable index part.
+//
+// Locking mirrors the data path: writeMu is held only across the brief
+// "snapshot memtable + seal WAL" boundary (so concurrent Write is not blocked on
+// the index-block write), while e.mu is held across the whole block write so a
+// concurrent Lookup never observes a state where the memtable has been
+// snapshotted but the new part is not yet in e.parts (which would cause false
+// negatives while coverage reports complete). flushMu serializes flushes so the
+// WAL seal/discard invariant holds.
 func (e *IndexEngine) Flush(ctx context.Context) error {
+	e.flushMu.Lock()
+	defer e.flushMu.Unlock()
+
+	// Brief boundary: snapshot the memtable and seal the WAL atomically vs Write.
+	// e.mu is taken here and held until the new part is published, so Lookup never
+	// sees the snapshotted entries "in flight".
 	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	var entries []shrimptypes.IndexEntry
 	e.mem.SnapshotView(func(snapshot []shrimptypes.IndexEntry) {
 		entries = make([]shrimptypes.IndexEntry, len(snapshot))
 		copy(entries, snapshot)
 	})
 	if len(entries) == 0 {
+		e.mu.Unlock()
+		e.writeMu.Unlock()
 		return nil
+	}
+	sealedSeq, sealErr := e.wal.Seal()
+	e.writeMu.Unlock() // Write may now append to the fresh active segment + memtable.
+	if sealErr != nil {
+		e.mem.Write(entries) // nothing sealed cleanly; put entries back for a retry
+		e.mu.Unlock()
+		return fmt.Errorf("seal index wal: %w", sealErr)
 	}
 
 	slices.SortFunc(entries, func(a, b shrimptypes.IndexEntry) int {
@@ -239,18 +261,17 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 		return a.Token == b.Token && a.DataID == b.DataID
 	})
 
-	if len(entries) == 0 {
-		return nil
-	}
-
 	id := fmt.Sprintf("%d-%s", time.Now().UnixNano(), e.nodeID)
 	indexDir := filepath.Join(e.dataDir, "index")
 	path := filepath.Join(indexDir, id+".json")
 	metaPath := filepath.Join(indexDir, id+".meta")
 	compression := shrimpblock.CompressionZstd
 
+	// On any failure, restore the entries to the memtable and keep the sealed WAL
+	// segment as their durable copy (a later flush discards it).
 	if err := shrimpblock.WriteIndexBlock(path, shrimptypes.IndexBlock{Entries: entries}, compression); err != nil {
-		e.mem.Write(entries) // restore on failure
+		e.mem.Write(entries)
+		e.mu.Unlock()
 		return fmt.Errorf("write index block: %w", err)
 	}
 
@@ -268,14 +289,18 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
 		e.mem.Write(entries)
+		e.mu.Unlock()
 		return fmt.Errorf("write index meta: %w", err)
 	}
 
-	if err := e.wal.Rotate(); err != nil {
-		slog.WarnContext(ctx, "index wal rotate failed", "error", err)
-	}
-
 	e.parts = append(e.parts, meta)
+	e.mu.Unlock()
+
+	// Entries are now durable in the index part: the sealed WAL segments are
+	// redundant and can be deleted.
+	if err := e.wal.Discard(sealedSeq); err != nil {
+		slog.WarnContext(ctx, "index wal discard failed", "error", err)
+	}
 
 	slog.InfoContext(ctx, "flushed index part", "id", id, "count", meta.Count)
 	return nil
