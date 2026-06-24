@@ -63,7 +63,7 @@ func (l *LSM) flush(ctx context.Context) error {
 		BlockCount:    len(blockHeaders),
 	}
 
-	if err := writeMeta(metaPath, meta); err != nil {
+	if err := WriteMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
 		l.mem.Write(entries)
 		return fmt.Errorf("write meta: %w", err)

@@ -22,46 +22,20 @@ func (l *LSM) sidecarPath(id string) string {
 	return filepath.Join(l.dataDir, "parts", id+".sparse.json")
 }
 
-func (l *LSM) readLocalPart(id string) (shrimptypes.Block, error) {
-	f, err := os.Open(l.partPath(id)) // #nosec G304 -- trusted internal part path
-	if err != nil {
-		return shrimptypes.Block{}, err
-	}
-	r, _, err := shrimpblock.OpenBlockReader(f)
-	if err != nil {
-		_ = f.Close()
-		return shrimptypes.Block{}, err
-	}
-	var b shrimptypes.Block
-	decodeErr := json.NewDecoder(r).Decode(&b)
-	rCloseErr := r.Close()
-	fCloseErr := f.Close()
-	if decodeErr != nil {
-		return shrimptypes.Block{}, decodeErr
-	}
-	if rCloseErr != nil {
-		return shrimptypes.Block{}, rCloseErr
-	}
-	return b, fCloseErr
-}
-
-// readPartBlock reads any local part (V2 binary or legacy JSON) and returns a Block.
+// readPartBlock reads a local V2 part and returns a Block.
 func (l *LSM) readPartBlock(meta shrimptypes.PartMeta) (shrimptypes.Block, error) {
-	if meta.FormatVersion == 1 {
-		pf, err := l.partMgr.Get(meta.ID, meta)
-		if err != nil {
-			return shrimptypes.Block{}, err
-		}
-		if pf == nil {
-			return shrimptypes.Block{}, fmt.Errorf("v2 part not found: %s", meta.ID)
-		}
-		return shrimpblock.V2ToBlock(pf)
+	pf, err := l.partMgr.Get(meta.ID, meta)
+	if err != nil {
+		return shrimptypes.Block{}, err
 	}
-	return l.readLocalPart(meta.ID)
+	if pf == nil {
+		return shrimptypes.Block{}, fmt.Errorf("v2 part not found: %s", meta.ID)
+	}
+	return shrimpblock.V2ToBlock(pf)
 }
 
-// readMeta reads PartMeta from a .meta file on disk.
-func readMeta(path string) (shrimptypes.PartMeta, error) {
+// ReadMeta reads [shrimptypes.PartMeta] from a .meta file on disk.
+func ReadMeta(path string) (shrimptypes.PartMeta, error) {
 	f, err := os.Open(path) // #nosec G304 -- trusted internal part path
 	if err != nil {
 		return shrimptypes.PartMeta{}, err
@@ -74,8 +48,8 @@ func readMeta(path string) (shrimptypes.PartMeta, error) {
 	return meta, nil
 }
 
-// writeMeta writes meta to path atomically via a temp-file + rename.
-func writeMeta(path string, meta shrimptypes.PartMeta) error {
+// WriteMeta writes meta to path atomically via a temp-file + rename.
+func WriteMeta(path string, meta shrimptypes.PartMeta) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-meta-")
 	if err != nil {
 		return err

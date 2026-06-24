@@ -34,10 +34,6 @@ func (pm *PartManager) Get(id string, meta shrimptypes.PartMeta) (*shrimpblock.P
 		return pf, nil
 	}
 
-	if meta.FormatVersion != 1 {
-		return nil, nil
-	}
-
 	path := filepath.Join(pm.dataDir, "parts", id+".json")
 	pf, err := shrimpblock.OpenPartV2(path, meta)
 	if err != nil {

@@ -107,6 +107,5 @@ func (l *LSM) evictPart(id string) {
 	l.rowBlockCache.DeleteByFunc(func(k shrimptypes.RowCacheKey, _ *shrimptypes.RowBlock) bool {
 		return k.PartID == id
 	})
-	l.sparseCache.Delete(id)
 	l.partMgr.Release(id)
 }

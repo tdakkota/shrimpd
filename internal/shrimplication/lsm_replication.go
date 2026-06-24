@@ -29,7 +29,7 @@ func (l *LSM) startup(ctx context.Context) error {
 		metaPath := l.partMetaPath(id)
 		if _, err := os.Stat(metaPath); err == nil {
 			// Prefer disk meta — it retains tokens stripped from etcd.
-			if diskMeta, err := readMeta(metaPath); err == nil {
+			if diskMeta, err := ReadMeta(metaPath); err == nil {
 				loaded = append(loaded, diskMeta)
 			} else {
 				loaded = append(loaded, meta)
@@ -44,7 +44,7 @@ func (l *LSM) startup(ctx context.Context) error {
 			return err
 		}
 		meta.Compression = shrimpblock.DetectAlgo(raw)
-		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
+		if err := WriteMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return err
 		}
@@ -184,7 +184,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 		metaPath := l.partMetaPath(id)
 		if _, err := os.Stat(metaPath); err == nil {
 			// Prefer disk meta — it retains tokens stripped from etcd.
-			if diskMeta, err := readMeta(metaPath); err == nil {
+			if diskMeta, err := ReadMeta(metaPath); err == nil {
 				loaded = append(loaded, diskMeta)
 			} else {
 				loaded = append(loaded, meta)
@@ -199,7 +199,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 			return fmt.Errorf("write part: %w", err)
 		}
 		meta.Compression = shrimpblock.DetectAlgo(raw)
-		if err := writeMeta(l.partMetaPath(id), meta); err != nil {
+		if err := WriteMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return fmt.Errorf("write meta: %w", err)
 		}
@@ -254,7 +254,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 			return fmt.Errorf("write part: %w", err)
 		}
 		entry.Part.Compression = shrimpblock.DetectAlgo(raw)
-		if err := writeMeta(metaPath, entry.Part); err != nil {
+		if err := WriteMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
 		}
@@ -290,7 +290,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 			return fmt.Errorf("write part: %w", err)
 		}
 		entry.Part.Compression = shrimpblock.DetectAlgo(raw)
-		if err := writeMeta(metaPath, entry.Part); err != nil {
+		if err := WriteMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
 		}

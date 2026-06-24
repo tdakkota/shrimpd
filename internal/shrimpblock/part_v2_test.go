@@ -40,14 +40,14 @@ func TestStreamRowBlockMatcher_AllocsOnReject(t *testing.T) {
 	})
 
 	// Measure allocs for a matcher that rejects most lines.
-	// Per-block decode allocates (zstd + jx + timestamp slice), but rejected rows
-	// must not allocate Go strings for data or labels. Bound accounts for one block
-	// decode; the key guarantee is "no per-rejected-row string allocation".
+	// Per-block decode allocates (zstd + compressed/decompressed buffers + BinBlock),
+	// but rejected rows must not allocate Go strings for data or labels.
+	// With binblock decode (unsafe.Slice path) the per-block overhead is minimal.
 	allocs := testing.AllocsPerRun(100, func() {
 		_ = StreamRowBlockMatcher(pf, 0, 0, 1<<62, m, func(e shrimptypes.Entry) error { return nil })
 	})
-	if allocs > 30 {
-		t.Fatalf("expected <=30 allocs per call for rejected-heavy matcher (block decode), got %v", allocs)
+	if allocs > 15 {
+		t.Fatalf("expected <=15 allocs per call for rejected-heavy matcher (block decode), got %v", allocs)
 	}
 
 	_ = got // silence

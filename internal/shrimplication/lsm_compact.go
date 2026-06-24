@@ -85,29 +85,21 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 
 	var merged []shrimptypes.Entry
 	for _, meta := range levelParts {
-		if meta.FormatVersion == 1 {
-			pf, err := l.partMgr.Get(meta.ID, meta)
+		pf, err := l.partMgr.Get(meta.ID, meta)
+		if err != nil {
+			return fmt.Errorf("open v2 %s: %w", meta.ID, err)
+		}
+		if pf == nil {
+			return fmt.Errorf("v2 part not available: %s", meta.ID)
+		}
+		for i := range pf.Headers {
+			rb, err := shrimpblock.ReadRowBlock(pf, i)
 			if err != nil {
-				return fmt.Errorf("open v2 %s: %w", meta.ID, err)
+				return fmt.Errorf("read block %s[%d]: %w", meta.ID, i, err)
 			}
-			if pf == nil {
-				return fmt.Errorf("v2 part not available: %s", meta.ID)
+			for j := range rb.Timestamps {
+				merged = append(merged, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
 			}
-			for i := range pf.Headers {
-				rb, err := shrimpblock.ReadRowBlock(pf, i)
-				if err != nil {
-					return fmt.Errorf("read block %s[%d]: %w", meta.ID, i, err)
-				}
-				for j := range rb.Timestamps {
-					merged = append(merged, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
-				}
-			}
-		} else {
-			b, err := l.readLocalPart(meta.ID)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", meta.ID, err)
-			}
-			merged = append(merged, b.Data...)
 		}
 	}
 	if len(merged) == 0 {
@@ -146,7 +138,7 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		BlockCount:    len(blockHeaders),
 	}
 
-	if err := writeMeta(metaPath, meta); err != nil {
+	if err := WriteMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
 		return fmt.Errorf("write meta: %w", err)
 	}

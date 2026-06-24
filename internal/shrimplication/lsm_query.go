@@ -60,19 +60,7 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 		}
 	}
 
-	var (
-		result    = make([]shrimptypes.Entry, 0)
-		getSparse = func(id string) []shrimptypes.SparseEntry {
-			if s, ok := l.sparseCache.Get(id); ok {
-				return s
-			}
-			s, _ := shrimpblock.ReadSidecar(l.sidecarPath(id))
-			if s != nil {
-				l.sparseCache.Set(id, s)
-			}
-			return s
-		}
-	)
+	result := make([]shrimptypes.Entry, 0)
 	for _, meta := range timeParts {
 		if useIndexFilter {
 			if _, matched := indexedPartIDs[meta.ID]; !matched {
@@ -89,62 +77,43 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 		}
 		stats.PartsScanned++
 
-		// Try V2 path first
-		if meta.FormatVersion == 1 {
-			pf, err := l.partMgr.Get(meta.ID, meta)
-			if err != nil {
-				return nil, stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
-			}
-			if pf == nil {
-				return nil, stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
-			}
-			for i, hdr := range pf.Headers {
-				if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
-					stats.BlocksPrunedByTS++
-					continue
-				}
-				if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-					stats.BlocksPrunedByIndex++
-					continue
-				}
-				stats.BlocksScanned++
-
-				ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-				rb, ok := l.rowBlockCache.Get(ck)
-				if !ok {
-					var err error
-					rb, err = shrimpblock.ReadRowBlock(pf, i)
-					if err != nil {
-						slog.WarnContext(ctx, "read row block", "id", meta.ID, "block", i, "error", err)
-						continue
-					}
-					l.rowBlockCache.Set(ck, rb)
-				}
-
-				for j := range rb.Timestamps {
-					stats.EntriesScanned++
-					e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
-					if e.Matches(from, to, normalizedTerm) {
-						result = append(result, e)
-						stats.EntriesMatched++
-					}
-				}
-			}
-			continue
-		}
-
-		// Legacy path
-		block, err := l.readLocalPart(meta.ID)
+		pf, err := l.partMgr.Get(meta.ID, meta)
 		if err != nil {
-			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
-			continue
+			return nil, stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
 		}
-		_ = getSparse(meta.ID)
-		for _, e := range block.Data {
-			stats.EntriesScanned++
-			if e.Matches(from, to, normalizedTerm) {
-				result = append(result, e)
-				stats.EntriesMatched++
+		if pf == nil {
+			return nil, stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
+		}
+		for i, hdr := range pf.Headers {
+			if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
+				stats.BlocksPrunedByTS++
+				continue
+			}
+			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
+				stats.BlocksPrunedByIndex++
+				continue
+			}
+			stats.BlocksScanned++
+
+			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
+			rb, ok := l.rowBlockCache.Get(ck)
+			if !ok {
+				var err error
+				rb, err = shrimpblock.ReadRowBlock(pf, i)
+				if err != nil {
+					slog.WarnContext(ctx, "read row block", "id", meta.ID, "block", i, "error", err)
+					continue
+				}
+				l.rowBlockCache.Set(ck, rb)
+			}
+
+			for j := range rb.Timestamps {
+				stats.EntriesScanned++
+				e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
+				if e.Matches(from, to, normalizedTerm) {
+					result = append(result, e)
+					stats.EntriesMatched++
+				}
 			}
 		}
 	}
@@ -209,17 +178,6 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 		}
 	}
 
-	getSparse := func(id string) []shrimptypes.SparseEntry {
-		if s, ok := l.sparseCache.Get(id); ok {
-			return s
-		}
-		s, _ := shrimpblock.ReadSidecar(l.sidecarPath(id))
-		if s != nil {
-			l.sparseCache.Set(id, s)
-		}
-		return s
-	}
-
 	for _, meta := range timeParts {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
@@ -239,67 +197,47 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 		}
 		stats.PartsScanned++
 
-		if meta.FormatVersion == 1 {
-			pf, err := l.partMgr.Get(meta.ID, meta)
-			if err != nil {
-				return stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
+		pf, err := l.partMgr.Get(meta.ID, meta)
+		if err != nil {
+			return stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
+		}
+		if pf == nil {
+			return stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
+		}
+		for i, hdr := range pf.Headers {
+			if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
+				stats.BlocksPrunedByTS++
+				continue
 			}
-			if pf == nil {
-				return stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
+			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
+				stats.BlocksPrunedByIndex++
+				continue
 			}
-			for i, hdr := range pf.Headers {
-				if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
-					stats.BlocksPrunedByTS++
-					continue
-				}
-				if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-					stats.BlocksPrunedByIndex++
-					continue
-				}
-				stats.BlocksScanned++
+			stats.BlocksScanned++
 
-				ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-				if rb, ok := l.rowBlockCache.Get(ck); ok {
-					for j := range rb.Timestamps {
-						stats.EntriesScanned++
-						e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
-						if e.Matches(from, to, normalizedTerm) {
-							stats.EntriesMatched++
-							if err := fn(e); err != nil {
-								return stats, err
-							}
+			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
+			if rb, ok := l.rowBlockCache.Get(ck); ok {
+				for j := range rb.Timestamps {
+					stats.EntriesScanned++
+					e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
+					if e.Matches(from, to, normalizedTerm) {
+						stats.EntriesMatched++
+						if err := fn(e); err != nil {
+							return stats, err
 						}
 					}
-					continue
 				}
-
-				// Cache miss: stream without building a RowBlock or populating cache.
-				stats.EntriesScanned += int(hdr.Count)
-				err := shrimpblock.StreamRowBlock(pf, i, from, to, normalizedTerm, func(e shrimptypes.Entry) error {
-					stats.EntriesMatched++
-					return fn(e)
-				})
-				if err != nil {
-					slog.WarnContext(ctx, "stream row block", "id", meta.ID, "block", i, "error", err)
-				}
+				continue
 			}
-			continue
-		}
 
-		// Legacy path.
-		block, err := l.readLocalPart(meta.ID)
-		if err != nil {
-			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
-			continue
-		}
-		_ = getSparse(meta.ID)
-		for _, e := range block.Data {
-			stats.EntriesScanned++
-			if e.Matches(from, to, normalizedTerm) {
+			// Cache miss: stream without building a RowBlock or populating cache.
+			stats.EntriesScanned += int(hdr.Count)
+			err := shrimpblock.StreamRowBlock(pf, i, from, to, normalizedTerm, func(e shrimptypes.Entry) error {
 				stats.EntriesMatched++
-				if err := fn(e); err != nil {
-					return stats, err
-				}
+				return fn(e)
+			})
+			if err != nil {
+				slog.WarnContext(ctx, "stream row block", "id", meta.ID, "block", i, "error", err)
 			}
 		}
 	}
@@ -348,99 +286,58 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 		}
 	}
 
-	getSparse := func(id string) []shrimptypes.SparseEntry {
-		if s, ok := l.sparseCache.Get(id); ok {
-			return s
-		}
-		s, _ := shrimpblock.ReadSidecar(l.sidecarPath(id))
-		if s != nil {
-			l.sparseCache.Set(id, s)
-		}
-		return s
-	}
-
 	for _, meta := range timeParts {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
 		}
 		stats.PartsScanned++
 
-		if meta.FormatVersion == 1 {
-			pf, err := l.partMgr.Get(meta.ID, meta)
-			if err != nil {
-				return stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
+		pf, err := l.partMgr.Get(meta.ID, meta)
+		if err != nil {
+			return stats, fmt.Errorf("open v2 part %s: %w", meta.ID, err)
+		}
+		if pf == nil {
+			return stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
+		}
+		for i, hdr := range pf.Headers {
+			if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
+				stats.BlocksPrunedByTS++
+				continue
 			}
-			if pf == nil {
-				return stats, fmt.Errorf("v2 part %s not found on disk (replication pending?)", meta.ID)
-			}
-			for i, hdr := range pf.Headers {
-				if hdr.MaxTimestamp < from || hdr.MinTimestamp > to {
-					stats.BlocksPrunedByTS++
-					continue
-				}
-				stats.BlocksScanned++
+			stats.BlocksScanned++
 
-				ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-				if rb, ok := l.rowBlockCache.Get(ck); ok {
-					for j := range rb.Timestamps {
-						stats.EntriesScanned++
-						e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
-						if e.Timestamp < from || e.Timestamp > to {
+			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
+			if rb, ok := l.rowBlockCache.Get(ck); ok {
+				for j := range rb.Timestamps {
+					stats.EntriesScanned++
+					e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
+					if e.Timestamp < from || e.Timestamp > to {
+						continue
+					}
+					if !m.MatchLine(e.Data) {
+						continue
+					}
+					if len(m.Labels) > 0 {
+						labels := shrimpfilter.ExtractLabels(e.Data)
+						if !m.MatchLabels(labels) {
 							continue
-						}
-						if !m.MatchLine(e.Data) {
-							continue
-						}
-						if len(m.Labels) > 0 {
-							labels := shrimpfilter.ExtractLabels(e.Data)
-							if !m.MatchLabels(labels) {
-								continue
-							}
-						}
-						stats.EntriesMatched++
-						if err := fn(e); err != nil {
-							return stats, err
 						}
 					}
-					continue
-				}
-
-				stats.EntriesScanned += int(hdr.Count)
-				err := shrimpblock.StreamRowBlockMatcher(pf, i, from, to, m, func(e shrimptypes.Entry) error {
 					stats.EntriesMatched++
-					return fn(e)
-				})
-				if err != nil {
-					slog.WarnContext(ctx, "stream row block matcher", "id", meta.ID, "block", i, "error", err)
+					if err := fn(e); err != nil {
+						return stats, err
+					}
 				}
+				continue
 			}
-			continue
-		}
 
-		// Legacy path.
-		block, err := l.readLocalPart(meta.ID)
-		if err != nil {
-			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
-			continue
-		}
-		_ = getSparse(meta.ID)
-		for _, e := range block.Data {
-			stats.EntriesScanned++
-			if e.Timestamp < from || e.Timestamp > to {
-				continue
-			}
-			if !m.MatchLine(e.Data) {
-				continue
-			}
-			if len(m.Labels) > 0 {
-				labels := shrimpfilter.ExtractLabels(e.Data)
-				if !m.MatchLabels(labels) {
-					continue
-				}
-			}
-			stats.EntriesMatched++
-			if err := fn(e); err != nil {
-				return stats, err
+			stats.EntriesScanned += int(hdr.Count)
+			err := shrimpblock.StreamRowBlockMatcher(pf, i, from, to, m, func(e shrimptypes.Entry) error {
+				stats.EntriesMatched++
+				return fn(e)
+			})
+			if err != nil {
+				slog.WarnContext(ctx, "stream row block matcher", "id", meta.ID, "block", i, "error", err)
 			}
 		}
 	}

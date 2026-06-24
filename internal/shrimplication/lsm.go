@@ -41,7 +41,6 @@ type LSM struct {
 	idxEngine *IndexEngine // Separate Index Engine
 
 	rowBlockCache otter.Cache[shrimptypes.RowCacheKey, *shrimptypes.RowBlock] // keyed by (partID, block index)
-	sparseCache   otter.Cache[string, []shrimptypes.SparseEntry]              // keyed by partID, for legacy parts
 	partMgr       *PartManager                                                // manages open V2 part files
 }
 
@@ -49,9 +48,16 @@ type LSM struct {
 // tests and benchmarks that drive the LSM directly without calling Run.
 func (l *LSM) Close() error {
 	l.partMgr.Close()
-	l.sparseCache.Close()
 	l.rowBlockCache.Close()
 	return l.idxEngine.Close()
+}
+
+// SetParts replaces the in-memory part list.
+// It is intended for tests and benchmarks that bypass startup/bootstrap.
+func (l *LSM) SetParts(parts []shrimptypes.PartMeta) {
+	l.mu.Lock()
+	l.parts = append([]shrimptypes.PartMeta(nil), parts...)
+	l.mu.Unlock()
 }
 
 // NewLSM creates an LSM instance and replays unflushed entries from the WAL.
@@ -67,12 +73,6 @@ func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg *Registry) (*L
 		}).
 		Build()
 
-	sparseCache, _ := otter.MustBuilder[string, []shrimptypes.SparseEntry](8 << 20).
-		Cost(func(_ string, s []shrimptypes.SparseEntry) uint32 {
-			return uint32(len(s) * 12)
-		}).
-		Build()
-
 	l := &LSM{
 		nodeID:        nodeID,
 		addr:          addr,
@@ -83,7 +83,6 @@ func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg *Registry) (*L
 		flushSig:      make(chan struct{}, 1),
 		idxEngine:     idx,
 		rowBlockCache: rowBlockCache,
-		sparseCache:   sparseCache,
 		partMgr:       NewPartManager(dataDir),
 	}
 	// Replay WAL to recover any entries not yet flushed to a part.
@@ -131,7 +130,6 @@ func (l *LSM) Run(ctx context.Context) error {
 				_ = l.flush(context.Background())
 			}
 			l.partMgr.Close()
-			l.sparseCache.Close()
 			l.rowBlockCache.Close()
 			_ = l.idxEngine.Close()
 			return ctx.Err()
