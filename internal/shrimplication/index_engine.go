@@ -25,22 +25,26 @@ const indexFlushThreshold = 1000
 type IndexEngine struct {
 	nodeID  string
 	dataDir string
-	mem     *IndexMemTable
-	wal     *shrimpwal.IndexWAL
-	// writeMu makes "snapshot the memtable + seal the WAL" atomic with respect to
-	// concurrent Write. Held only across that brief boundary, never across the
-	// heavy index-block write.
-	writeMu sync.Mutex
-	// flushMu serializes whole flushes against each other (required for the WAL
-	// seal/discard invariant to hold).
-	flushMu  sync.Mutex
-	flushSig chan struct{}
-	mu       sync.RWMutex
 
+	// writeMu guards the pairing of mem.Write+wal.Enqueue (in Write) against
+	// mem snapshot+wal.Seal (in Flush), so the sealed WAL segment's contents
+	// exactly equal the flushed snapshot. Held only across that brief boundary,
+	// never across the heavy index-block write.
+	writeMu sync.Mutex
+	mem     *IndexMemTable      // own internal lock; see writeMu/mu for cross-field invariants
+	wal     *shrimpwal.IndexWAL // own internal lock; see writeMu
+
+	flushSig chan struct{} // buffered(1): signals the Run loop to flush
+
+	// mu guards parts and covered, and is also held for the whole duration of a
+	// Flush so Lookup never observes the memtable drained before the new part is
+	// published (which would falsely prune). Because it is held across the entire
+	// flush, it also serializes flushes against each other.
+	mu      sync.RWMutex
 	parts   []shrimptypes.IndexPartMeta
 	covered map[string]struct{}
 
-	idxBlockCache otter.Cache[string, shrimptypes.IndexBlock] // keyed by absolute path
+	idxBlockCache otter.Cache[string, shrimptypes.IndexBlock] // keyed by absolute path; own internal lock
 }
 
 // NewIndexEngine initializes the IndexEngine, recovers WAL, and loads metadata.
@@ -194,19 +198,22 @@ func (e *IndexEngine) MarkCovered(dataIDs []string) error {
 	return e.saveCovered()
 }
 
-// Write appends entries to the index WAL and writes to memtable.
+// Write appends entries to the index WAL and writes to memtable. The fsync wait
+// happens after releasing writeMu (group commit); see LSM.Write for the rationale.
 func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	commit := e.wal.Enqueue(entries)
+	e.mem.Write(entries)
+	full := e.mem.Len() >= indexFlushThreshold
+	e.writeMu.Unlock()
 
-	if err := e.wal.Append(entries); err != nil {
+	if err := commit.Wait(); err != nil {
 		return fmt.Errorf("index wal append: %w", err)
 	}
-	e.mem.Write(entries)
-	if e.mem.Len() >= indexFlushThreshold {
+	if full {
 		select {
 		case e.flushSig <- struct{}{}:
 		default:
@@ -217,30 +224,24 @@ func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 
 // Flush sorts/deduplicates the index memtable and writes an immutable index part.
 //
-// Locking mirrors the data path: writeMu is held only across the brief
-// "snapshot memtable + seal WAL" boundary (so concurrent Write is not blocked on
-// the index-block write), while e.mu is held across the whole block write so a
-// concurrent Lookup never observes a state where the memtable has been
-// snapshotted but the new part is not yet in e.parts (which would cause false
-// negatives while coverage reports complete). flushMu serializes flushes so the
-// WAL seal/discard invariant holds.
+// Lock order is mu → writeMu. mu is held for the whole flush: it both serializes
+// flushes against each other and prevents a concurrent Lookup from observing the
+// memtable drained before the new part is published (which would falsely prune).
+// writeMu is held only across the brief "snapshot memtable + seal WAL" boundary,
+// then released so concurrent Write is not blocked on the heavy index-block write.
 func (e *IndexEngine) Flush(ctx context.Context) error {
-	e.flushMu.Lock()
-	defer e.flushMu.Unlock()
+	e.mu.Lock()
 
 	// Brief boundary: snapshot the memtable and seal the WAL atomically vs Write.
-	// e.mu is taken here and held until the new part is published, so Lookup never
-	// sees the snapshotted entries "in flight".
 	e.writeMu.Lock()
-	e.mu.Lock()
 	var entries []shrimptypes.IndexEntry
 	e.mem.SnapshotView(func(snapshot []shrimptypes.IndexEntry) {
 		entries = make([]shrimptypes.IndexEntry, len(snapshot))
 		copy(entries, snapshot)
 	})
 	if len(entries) == 0 {
-		e.mu.Unlock()
 		e.writeMu.Unlock()
+		e.mu.Unlock()
 		return nil
 	}
 	sealedSeq, sealErr := e.wal.Seal()

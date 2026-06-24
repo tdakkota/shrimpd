@@ -15,15 +15,24 @@ import (
 )
 
 // Write is safe for concurrent use. Durable after WAL fsync.
+//
+// The WAL bytes are enqueued and the memtable updated under writeMu (so the
+// snapshot+seal in flush captures exactly the enqueued set), but the fsync wait
+// happens after releasing writeMu — letting concurrent writers share one fsync
+// via group commit. The entry is in the memtable before the fsync confirms; on a
+// (catastrophic, rare) fsync error the caller is told the write failed even
+// though a later flush may still persist it, i.e. at-least-once semantics.
 func (l *LSM) Write(_ context.Context, entries []shrimptypes.Entry) error {
 	l.writeMu.Lock()
-	defer l.writeMu.Unlock()
+	commit := l.wal.Enqueue(entries)
+	l.mem.Write(entries)
+	full := l.mem.Len() >= flushThreshold
+	l.writeMu.Unlock()
 
-	if err := l.wal.Append(entries); err != nil {
+	if err := commit.Wait(); err != nil {
 		return fmt.Errorf("wal: %w", err)
 	}
-	l.mem.Write(entries)
-	if l.mem.Len() >= flushThreshold {
+	if full {
 		select {
 		case l.flushSig <- struct{}{}:
 		default: // already signaled

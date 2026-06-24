@@ -2,6 +2,7 @@ package shrimpwal
 
 import (
 	"bufio"
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,9 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 )
+
+// syncFile fsyncs a segment file. It is a package var so tests can inject
+// latency to exercise group-commit batching deterministically.
+var syncFile = (*os.File).Sync
 
 // segLog is a generic segmented append-only log shared by WAL and IndexWAL.
 //
@@ -19,21 +25,48 @@ import (
 // provides crash-safe seal/discard semantics; it does not interpret line
 // contents. The typed wrappers encode/decode each line.
 //
-// Flush protocol:
+// # Group commit
 //
-//	seq, _ := s.seal()   // close active segment, open a fresh one
-//	... persist data elsewhere (slow); no seg lock held ...
+// Appends are batched: enqueue copies the encoded bytes into an in-memory
+// pending buffer (cheap, under mu) and returns a commit handle. The first
+// waiter to call commitWait becomes the batch "leader", writes the whole
+// pending buffer to the active segment, and fsyncs once for everyone; other
+// waiters in that batch return as soon as the leader finishes. While that single
+// fsync is in flight, concurrent enqueues accumulate into the next batch, so the
+// batch size self-tunes to the fsync latency — no timer and no fixed latency
+// floor. This is the standard leader/follower group commit.
+//
+// # Flush protocol
+//
+//	seq, _ := s.seal()   // flush pending, close active segment, open a fresh one
+//	... persist data elsewhere (slow) ...
 //	s.discard(seq)       // delete the now-redundant sealed segments
 //
 // recover replays every segment, so a crash between seal and discard simply
 // replays the sealed lines. The caller's invariant: the live in-memory set
 // equals the union of all not-yet-discarded segments.
 type segLog struct {
+	// ioMu serializes file I/O (the leader's write+fsync, seal, discard, close),
+	// so at most one goroutine touches the segment files at a time.
+	ioMu sync.Mutex
+	// mu protects the in-memory batch state and the active-segment fields.
 	mu        sync.Mutex
 	dir       string
 	prefix    string
 	active    *os.File
 	activeSeq uint64
+
+	pending []byte  // encoded bytes not yet written+fsynced
+	cur     *commit // batch the pending bytes belong to; nil when pending is empty
+
+	syncs atomic.Uint64 // count of fsyncs performed; for tests/observability
+}
+
+// commit is a group-commit batch result. done/err are written by the leader and
+// read by waiters, both under ioMu.
+type commit struct {
+	done bool
+	err  error
 }
 
 // openSegLog opens (or creates) a segmented log rooted at path. The directory
@@ -95,6 +128,7 @@ func (s *segLog) segPath(seq uint64) string {
 }
 
 // listSegments returns the sequence numbers of all segments on disk, ascending.
+// Callers that mutate the segment set (seal, discard) hold ioMu.
 func (s *segLog) listSegments() ([]uint64, error) {
 	ents, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -121,27 +155,99 @@ func (s *segLog) listSegments() ([]uint64, error) {
 	return seqs, nil
 }
 
-// append writes buf to the active segment and fsyncs before returning.
-func (s *segLog) append(buf []byte) error {
+// enqueue copies buf into the pending batch and returns its commit handle.
+// The bytes are durable only after the handle's commitWait returns nil.
+func (s *segLog) enqueue(buf []byte) *commit {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.active.Write(buf); err != nil {
-		return err
+	if s.cur == nil {
+		s.cur = &commit{}
 	}
-	return s.active.Sync()
+	s.pending = append(s.pending, buf...) // copies buf; the caller may reuse it
+	c := s.cur
+	s.mu.Unlock()
+	return c
 }
 
-// seal fsyncs and closes the active segment, then opens a fresh one. It returns
-// the sequence number of the sealed segment; pass it to discard once the
-// corresponding data is durable elsewhere.
+// commitWait blocks until the batch containing c has been written and fsynced.
+// The first waiter for the open batch becomes the leader and does the I/O for
+// every member; later members observe c.done and return immediately.
+func (s *segLog) commitWait(c *commit) error {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	if c.done {
+		return c.err
+	}
+	// We hold ioMu and c is not yet flushed, so s.cur is still c: become leader.
+	if err := s.flushPending(); err != nil {
+		return err
+	}
+	return c.err
+}
+
+// flushPending writes the current pending buffer to the active segment and
+// fsyncs once, resolving the batch. Must be called with ioMu held. The pending
+// snapshot is taken under mu; the write+fsync runs without mu so concurrent
+// enqueues accumulate into the next batch.
+func (s *segLog) flushPending() error {
+	s.mu.Lock()
+	if s.cur == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	buf := s.pending
+	batch := s.cur
+	s.pending = nil
+	s.cur = nil
+	f := s.active
+	s.mu.Unlock()
+
+	_, werr := f.Write(buf)
+	var serr error
+	if werr == nil {
+		serr = s.fsync(f)
+	}
+	err := cmp.Or(werr, serr)
+	batch.err = err
+	batch.done = true
+	return err
+}
+
+// fsync syncs f and counts it.
+func (s *segLog) fsync(f *os.File) error {
+	s.syncs.Add(1)
+	return syncFile(f)
+}
+
+// seal flushes any pending bytes to the active segment, closes it, and opens a
+// fresh one. It returns the sequence number of the sealed segment; pass it to
+// discard once the corresponding data is durable elsewhere.
+//
+// seal holds mu across the flush+swap so a concurrent enqueue cannot attach
+// bytes to a segment that is being retired.
 func (s *segLog) seal() (uint64, error) {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sealed := s.activeSeq
-	if err := s.active.Sync(); err != nil {
-		return 0, err
+	// Flush pending to the current active segment before retiring it.
+	if s.cur != nil {
+		_, werr := s.active.Write(s.pending)
+		var serr error
+		if werr == nil {
+			serr = s.fsync(s.active)
+		}
+		err := cmp.Or(werr, serr)
+		s.cur.err = err
+		s.cur.done = true
+		s.pending = nil
+		s.cur = nil
+		if err != nil {
+			return 0, err
+		}
 	}
+
+	sealed := s.activeSeq
 	if err := s.active.Close(); err != nil {
 		return 0, err
 	}
@@ -170,8 +276,12 @@ func (s *segLog) seal() (uint64, error) {
 // active segment is never removed. Safe to call repeatedly: missing files are
 // ignored, so a crash between seal and discard converges on retry.
 func (s *segLog) discard(uptoSeq uint64) error {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	activeSeq := s.activeSeq
+	s.mu.Unlock()
 
 	seqs, err := s.listSegments()
 	if err != nil {
@@ -179,7 +289,7 @@ func (s *segLog) discard(uptoSeq uint64) error {
 	}
 	removed := false
 	for _, seq := range seqs {
-		if seq > uptoSeq || seq == s.activeSeq {
+		if seq > uptoSeq || seq == activeSeq {
 			continue
 		}
 		if err := os.Remove(s.segPath(seq)); err != nil && !os.IsNotExist(err) {
@@ -194,11 +304,16 @@ func (s *segLog) discard(uptoSeq uint64) error {
 }
 
 // forEachLine reads every non-empty line from every segment, oldest first, and
-// passes it to fn. Corrupt/partial trailing lines are the caller's concern: fn
-// decides whether to skip them.
+// passes it to fn. Intended for startup recovery. Corrupt/partial trailing lines
+// are the caller's concern: fn decides whether to skip them.
 func (s *segLog) forEachLine(fn func(line []byte)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+
+	// Flush anything buffered (a no-op at startup, where recover is used).
+	if err := s.flushPending(); err != nil {
+		return err
+	}
 
 	seqs, err := s.listSegments()
 	if err != nil {
@@ -231,9 +346,13 @@ func (s *segLog) forEachLine(fn func(line []byte)) error {
 	return nil
 }
 
-// close closes the active segment file.
+// close flushes any pending bytes and closes the active segment file.
 func (s *segLog) close() error {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	flushErr := s.flushPending()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.active.Close()
+	closeErr := s.active.Close()
+	return cmp.Or(flushErr, closeErr)
 }

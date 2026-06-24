@@ -42,19 +42,26 @@ type LSM struct {
 	addr    string
 	dataDir string
 
-	mem *MemTable
-	wal *shrimpwal.WAL
-	reg registryAPI
-	// writeMu makes "snapshot the memtable + seal the WAL" atomic with respect to
-	// concurrent Write, so the sealed segment's contents exactly match the snapshot.
-	// Held only across that brief boundary, never across the heavy flush I/O.
+	// writeMu guards the pairing of mem.Write+wal.Enqueue (in Write) against
+	// mem snapshot+wal.Seal (in flush), so the sealed WAL segment's contents
+	// exactly equal the flushed snapshot. Held only across that brief boundary,
+	// never across the heavy flush I/O.
 	writeMu sync.Mutex
-	// flushMu serializes whole flushes against each other (the Run loop and the
-	// HTTP-triggered Flush both call flush). Serial flushes are required for the
-	// WAL seal/discard invariant to hold.
-	flushMu  sync.Mutex
+	// flushMu serializes whole flushes against each other (both the Run loop and
+	// the HTTP-triggered Flush call flush). Serial flushes are required for the
+	// WAL seal/discard invariant. It is separate from mu because mu is held only
+	// briefly here (see below), so it cannot itself serialize flushes.
+	flushMu sync.Mutex
+	mem     *MemTable      // own internal lock; see writeMu for cross-field invariants
+	wal     *shrimpwal.WAL // own internal lock; see writeMu
+	reg     registryAPI
+
 	flushSig chan struct{} // buffered(1): signal from Write when threshold crossed
 
+	// mu guards parts (briefly, when a flush/compaction/replication publishes a
+	// new part). Unlike the index engine, it is NOT held across flush I/O: the
+	// query path reads the mem+parts union and tolerates a part appearing slightly
+	// later, so there is no in-flight-visibility hazard to protect against.
 	mu    sync.RWMutex
 	parts []shrimptypes.PartMeta // all parts replicated locally, kept in sync with etcd log
 

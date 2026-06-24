@@ -8,9 +8,9 @@ import (
 
 // IndexMemTable holds unflushed index entries in memory.
 type IndexMemTable struct {
+	mu         sync.Mutex // guards entries and tokenIndex
 	entries    []shrimptypes.IndexEntry
 	tokenIndex map[string]map[string]struct{}
-	mu         sync.Mutex
 }
 
 // Write appends entries to the memtable and updates the token index.

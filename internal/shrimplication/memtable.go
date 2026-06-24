@@ -12,7 +12,7 @@ import (
 // MemTable is the in-memory write buffer. Drained atomically by flush,
 // queried (without draining) by the query path.
 type MemTable struct {
-	mu      sync.RWMutex
+	mu      sync.RWMutex // guards entries
 	entries []shrimptypes.Entry
 }
 

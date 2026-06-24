@@ -39,9 +39,21 @@ func OpenWAL(path string) (*WAL, error) {
 	return &WAL{sl: sl}, nil
 }
 
-// Append writes entries to the active segment and fsyncs before returning.
-// All entries are encoded into a single pooled buffer and written in one syscall.
-func (w *WAL) Append(entries []Entry) error {
+// Commit is a handle for an enqueued, not-yet-durable WAL batch. Wait blocks
+// until the batch has been written and fsynced, returning any I/O error.
+type Commit struct {
+	sl *segLog
+	c  *commit
+}
+
+// Wait blocks until the enqueued entries are durable (fsynced).
+func (c *Commit) Wait() error { return c.sl.commitWait(c.c) }
+
+// Enqueue encodes entries and adds them to the pending group-commit batch
+// without waiting for the fsync. Callers must Wait on the returned Commit to get
+// the durability guarantee; doing so outside any caller-held lock lets
+// concurrent enqueues share a single fsync (group commit).
+func (w *WAL) Enqueue(entries []Entry) *Commit {
 	jw := jx.GetWriter()
 	defer jx.PutWriter(jw)
 
@@ -54,7 +66,13 @@ func (w *WAL) Append(entries []Entry) error {
 		jw.ObjEnd()
 		jw.Buf = append(jw.Buf, '\n')
 	}
-	return w.sl.append(jw.Buf)
+	return &Commit{sl: w.sl, c: w.sl.enqueue(jw.Buf)}
+}
+
+// Append writes entries to the active segment and fsyncs before returning.
+// Concurrent Appends batch their fsyncs via group commit.
+func (w *WAL) Append(entries []Entry) error {
+	return w.Enqueue(entries).Wait()
 }
 
 // Seal closes the active segment and opens a fresh one, returning the sealed

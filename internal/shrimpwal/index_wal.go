@@ -21,8 +21,9 @@ func OpenIndexWAL(path string) (*IndexWAL, error) {
 	return &IndexWAL{sl: sl}, nil
 }
 
-// Append writes entries to the active segment and fsyncs before returning.
-func (w *IndexWAL) Append(entries []IndexEntry) error {
+// Enqueue encodes entries and adds them to the pending group-commit batch
+// without waiting for the fsync. Callers must Wait on the returned Commit.
+func (w *IndexWAL) Enqueue(entries []IndexEntry) *Commit {
 	jw := jx.GetWriter()
 	defer jx.PutWriter(jw)
 
@@ -35,7 +36,13 @@ func (w *IndexWAL) Append(entries []IndexEntry) error {
 		jw.ObjEnd()
 		jw.Buf = append(jw.Buf, '\n')
 	}
-	return w.sl.append(jw.Buf)
+	return &Commit{sl: w.sl, c: w.sl.enqueue(jw.Buf)}
+}
+
+// Append writes entries to the active segment and fsyncs before returning.
+// Concurrent Appends batch their fsyncs via group commit.
+func (w *IndexWAL) Append(entries []IndexEntry) error {
+	return w.Enqueue(entries).Wait()
 }
 
 // Seal closes the active segment and opens a fresh one, returning the sealed
