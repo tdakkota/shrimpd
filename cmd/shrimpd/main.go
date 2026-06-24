@@ -105,7 +105,7 @@ func main() {
 	shutdown, otelHandler, err := initOTEL(context.Background(), *nodeID)
 	if err != nil {
 		slog.Warn("failed to initialize OpenTelemetry logging, falling back to console-only", "error", err)
-	} else {
+	} else if otelHandler != nil {
 		handler = slogmulti.Fanout(consoleHandler, otelHandler)
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -248,6 +248,10 @@ func heapMonitor(ctx context.Context, dir string, threshold int64, interval time
 }
 
 func initOTEL(ctx context.Context, nodeID string) (func(context.Context) error, slog.Handler, error) {
+	if os.Getenv("OTEL_LOGS_EXPORTER") == "none" {
+		return func(_ context.Context) error { return nil }, nil, nil
+	}
+
 	exporter, err := otlploghttp.New(ctx)
 	if err != nil {
 		return nil, nil, err

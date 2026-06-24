@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.13
@@ -16,20 +15,53 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1024M
+  gateway:
+    build: ..
+    image: tdakkota/shrimpd:latest
+    entrypoint: ["/shrimpgateway"]
+    command:
+      - -addr=:8080
+      - -upstreams=http://shrimpd-1:8080,http://shrimpd-2:8080,http://shrimpd-3:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      shrimpd-1:
+        condition: service_started
+      shrimpd-2:
+        condition: service_started
+      shrimpd-3:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
   shrimpd-1:
     build: ..
     image: tdakkota/shrimpd:latest
+    environment:
+      - OTEL_LOGS_EXPORTER=none
     command:
       - -id=shrimpd-1
       - -addr=shrimpd-1:8080
       - -data=/data
       - -etcd=etcd:2379
-    environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - -pprof=:6060
+      - -memlimit=419430400        # 400 MiB — triggers aggressive GC before cgroup kills
+      - -memprofile-dir=/profiles
+      - -memprofile-threshold=314572800  # dump at 300 MiB heap_inuse
+    expose:
+      - "8080"
     ports:
-      - "8080:8080"
+      - "6061:6060"
     volumes:
       - ./nodes/node-1:/data
+      - ./profiles/node-1:/profiles
     depends_on:
       etcd:
         condition: service_healthy
@@ -41,17 +73,24 @@ services:
   shrimpd-2:
     build: ..
     image: tdakkota/shrimpd:latest
+    environment:
+      - OTEL_LOGS_EXPORTER=none
     command:
       - -id=shrimpd-2
       - -addr=shrimpd-2:8080
       - -data=/data
       - -etcd=etcd:2379
-    environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - -pprof=:6060
+      - -memlimit=419430400
+      - -memprofile-dir=/profiles
+      - -memprofile-threshold=314572800
+    expose:
+      - "8080"
     ports:
-      - "8081:8080"
+      - "6062:6060"
     volumes:
       - ./nodes/node-2:/data
+      - ./profiles/node-2:/profiles
     depends_on:
       etcd:
         condition: service_healthy
@@ -63,17 +102,24 @@ services:
   shrimpd-3:
     build: ..
     image: tdakkota/shrimpd:latest
+    environment:
+      - OTEL_LOGS_EXPORTER=none
     command:
       - -id=shrimpd-3
       - -addr=shrimpd-3:8080
       - -data=/data
       - -etcd=etcd:2379
-    environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - -pprof=:6060
+      - -memlimit=419430400
+      - -memprofile-dir=/profiles
+      - -memprofile-threshold=314572800
+    expose:
+      - "8080"
     ports:
-      - "8082:8080"
+      - "6063:6060"
     volumes:
       - ./nodes/node-3:/data
+      - ./profiles/node-3:/profiles
     depends_on:
       etcd:
         condition: service_healthy
@@ -82,12 +128,3 @@ services:
         limits:
           cpus: '1'
           memory: 512M
-
-  otelcol:
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.154.0
-    command: [ "--config=/etc/otelcol/config.yaml" ]
-    volumes:
-      - ./otelcol.yaml:/etc/otelcol/config.yaml
-    ports:
-      - "4317:4317"
-      - "4318:4318"

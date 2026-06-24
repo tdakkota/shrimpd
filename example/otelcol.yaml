@@ -5,17 +5,15 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-
 processors:
   batch:
-    timeout: 1s
-
+    timeout: 5s
+    send_batch_size: 10_000
 exporters:
   debug:
     verbosity: detailed
   otlphttp:
     endpoint: "http://shrimpd-1:8080"
-
 service:
   pipelines:
     logs:

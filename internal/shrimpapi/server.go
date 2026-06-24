@@ -48,8 +48,13 @@ func NewServer(addr string, lsm *shrimplication.LSM) *Server {
 	mux.HandleFunc("POST /ingest", s.handleIngest)
 	mux.HandleFunc("POST /ingest/otlp", s.handleIngestOTLP)
 	mux.HandleFunc("POST /v1/logs", s.handleIngestOTLP)
-	mux.HandleFunc("GET /read", s.handleQuery)
-	mux.HandleFunc("GET /query", s.handleQuery)
+	queryCompression, err := httpcompression.DefaultAdapter(httpcompression.MinSize(1024))
+	if err != nil {
+		panic(err)
+	}
+	queryHandler := queryCompression(http.HandlerFunc(s.handleQuery))
+	mux.Handle("GET /read", queryHandler)
+	mux.Handle("GET /query", queryHandler)
 	mux.HandleFunc("GET /part/{id}", s.handlePart)
 	mux.HandleFunc("GET /parts", s.handleParts)
 	mux.HandleFunc("POST /flush", s.handleFlush)
@@ -59,11 +64,6 @@ func NewServer(addr string, lsm *shrimplication.LSM) *Server {
 		slog.InfoContext(r.Context(), "incoming request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
-	wrapper, err := httpcompression.DefaultAdapter(httpcompression.MinSize(1024 * 1024))
-	if err != nil {
-		panic(err)
-	}
-	handler = wrapper(handler)
 
 	s.srv = &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	return s

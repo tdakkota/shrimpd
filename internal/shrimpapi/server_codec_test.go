@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-faster/jx"
@@ -196,7 +197,7 @@ func TestHandleQuery_Gzip(t *testing.T) {
 	defer lsm.Close()
 
 	require.NoError(t, lsm.Write(context.Background(), []shrimptypes.Entry{
-		{Timestamp: 1, Data: "hello"},
+		{Timestamp: 1, Data: strings.Repeat("hello ", 400)},
 		{Timestamp: 2, Data: "world"},
 	}))
 
@@ -225,7 +226,7 @@ func TestHandleQuery_Gzip(t *testing.T) {
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(body, &got))
 	require.Contains(t, got, "data")
-	require.Equal(t, []any{map[string]any{"timestamp": float64(1), "data": "hello"}}, got["data"])
+	require.Equal(t, []any{map[string]any{"timestamp": float64(1), "data": strings.Repeat("hello ", 400)}}, got["data"])
 }
 
 func BenchmarkDecodeIngestEntries(b *testing.B) {
