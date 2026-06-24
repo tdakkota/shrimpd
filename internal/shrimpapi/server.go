@@ -6,8 +6,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -109,43 +111,15 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		batch = batch[:0]
 	}
 
-	// Stream-decode {"data":[{"timestamp":N,"data":"..."},...]} entry by entry.
-	decodeErr := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
-		if string(key) != "data" {
-			return d.Skip()
-		}
-		return d.Arr(func(d *jx.Decoder) error {
-			if writeErr != nil {
-				return writeErr
-			}
-			var e shrimptypes.Entry
-			if err := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
-				switch string(key) {
-				case "timestamp":
-					v, err := d.Int64()
-					if err != nil {
-						return err
-					}
-					e.Timestamp = v
-				case "data":
-					v, err := d.Str()
-					if err != nil {
-						return err
-					}
-					e.Data = v
-				default:
-					return d.Skip()
-				}
-				return nil
-			}); err != nil {
-				return err
-			}
-			batch = append(batch, e)
-			if len(batch) >= ingestStreamBatch {
-				flush()
-			}
+	decodeErr := decodeIngestEntries(d, func(e shrimptypes.Entry) error {
+		if writeErr != nil {
 			return writeErr
-		})
+		}
+		batch = append(batch, e)
+		if len(batch) >= ingestStreamBatch {
+			flush()
+		}
+		return writeErr
 	})
 
 	if decodeErr != nil {
@@ -166,26 +140,6 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-type otlpScopeJSON struct {
-	Name       string         `json:"name,omitempty"`
-	Version    string         `json:"version,omitempty"`
-	Attributes map[string]any `json:"attributes,omitempty"`
-}
-
-type otlpLogRecordJSON struct {
-	Timestamp         uint64         `json:"timestamp"`
-	ObservedTimestamp uint64         `json:"observed_timestamp,omitempty"`
-	SeverityNumber    int32          `json:"severity_number,omitempty"`
-	SeverityText      string         `json:"severity_text,omitempty"`
-	Body              any            `json:"body,omitempty"`
-	Attributes        map[string]any `json:"attributes,omitempty"`
-	TraceID           string         `json:"trace_id,omitempty"`
-	SpanID            string         `json:"span_id,omitempty"`
-	Flags             uint32         `json:"flags,omitempty"`
-	Resource          map[string]any `json:"resource,omitempty"`
-	Scope             *otlpScopeJSON `json:"scope,omitempty"`
 }
 
 func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +180,8 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 
 	var entries []shrimptypes.Entry
 	now := time.Now().UnixNano()
+	jw := jx.GetWriter()
+	defer jx.PutWriter(jw)
 
 	rls := logsData.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
@@ -246,48 +202,14 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 					ts = pcommon.Timestamp(now)
 				}
 
-				rMap := resource.Attributes().AsRaw()
-				sObj := &otlpScopeJSON{
-					Name:       scope.Name(),
-					Version:    scope.Version(),
-					Attributes: scope.Attributes().AsRaw(),
-				}
-
-				bodyVal := record.Body().AsRaw()
-				attrMap := record.Attributes().AsRaw()
-
-				var traceIDHex string
-				if !record.TraceID().IsEmpty() {
-					traceIDHex = record.TraceID().String()
-				}
-				var spanIDHex string
-				if !record.SpanID().IsEmpty() {
-					spanIDHex = record.SpanID().String()
-				}
-
-				entryJSON := otlpLogRecordJSON{
-					Timestamp:         uint64(record.Timestamp()),
-					ObservedTimestamp: uint64(record.ObservedTimestamp()),
-					SeverityNumber:    int32(record.SeverityNumber()),
-					SeverityText:      record.SeverityText(),
-					Body:              bodyVal,
-					Attributes:        attrMap,
-					TraceID:           traceIDHex,
-					SpanID:            spanIDHex,
-					Flags:             uint32(record.Flags()),
-					Resource:          rMap,
-					Scope:             sObj,
-				}
-
-				dataBytes, err := json.Marshal(entryJSON)
-				if err != nil {
-					slog.WarnContext(r.Context(), "skip OTLP record: marshal failed", "error", err)
+				if err := writeOTLPLogRecordJSON(jw, record, resource.Attributes().AsRaw(), scope); err != nil {
+					slog.WarnContext(r.Context(), "skip OTLP record: encode failed", "error", err)
 					continue
 				}
 
 				entries = append(entries, shrimptypes.Entry{
 					Timestamp: int64(ts),
-					Data:      string(dataBytes),
+					Data:      string(jw.Buf),
 				})
 			}
 		}
@@ -328,43 +250,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	var m shrimpfilter.Matcher
 	if qstr := q.Get("q"); qstr != "" {
-		var qf struct {
-			Line []struct {
-				Op string `json:"op"`
-				V  string `json:"v"`
-			} `json:"line"`
-			Labels []struct {
-				L  string `json:"l"`
-				Op string `json:"op"`
-				V  string `json:"v"`
-			} `json:"labels"`
-		}
-		if err := json.Unmarshal([]byte(qstr), &qf); err != nil {
-			http.Error(w, "bad q: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		var lines []shrimpfilter.LineFilter
-		for _, lf := range qf.Line {
-			op, ok := parseLineOp(lf.Op)
-			if !ok {
-				http.Error(w, "bad line op: "+lf.Op, http.StatusBadRequest)
-				return
-			}
-			lines = append(lines, shrimpfilter.LineFilter{Op: op, Value: lf.V})
-		}
-		var labels []shrimpfilter.LabelFilter
-		for _, lf := range qf.Labels {
-			op, ok := parseLabelOp(lf.Op)
-			if !ok {
-				http.Error(w, "bad label op: "+lf.Op, http.StatusBadRequest)
-				return
-			}
-			labels = append(labels, shrimpfilter.LabelFilter{Label: lf.L, Op: op, Value: lf.V})
-		}
 		var err error
-		m, err = shrimpfilter.CompileMatcher(lines, labels)
+		m, err = decodeMatcherQuery(qstr)
 		if err != nil {
-			http.Error(w, "bad matcher: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
@@ -382,56 +271,370 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var err error
 	emit := func(e shrimptypes.Entry) error {
 		jw.Reset()
-		jw.ObjStart()
-		jw.RawStr(`"timestamp":`)
-		jw.Int64(e.Timestamp)
-		jw.RawStr(`,"data":`)
-		jw.Str(e.Data)
-		jw.ObjEnd()
 		if !first {
 			jw.Comma()
 		}
 		first = false
+		writeEntryJSON(jw, e)
 		_, werr := bw.Write(jw.Buf)
 		return werr
 	}
+
+	var stats *shrimptypes.QueryStats
 	if q.Get("q") != "" {
-		var stats *shrimptypes.QueryStats
 		stats, err = s.lsm.QueryMatcherWithStats(r.Context(), from, to, m, emit)
 		if err != nil {
-			slog.WarnContext(r.Context(), "stream query", "error", err)
+			slog.WarnContext(r.Context(), "query matcher", "error", err)
 		}
-
-		_, _ = bw.WriteString(`],"stats":`)
-		if statsBytes, merr := json.Marshal(stats); merr == nil {
-			_, _ = bw.Write(statsBytes)
-		} else {
-			_, _ = bw.WriteString(`null`)
-		}
-		_, _ = bw.WriteString(`}`)
-		if ferr := bw.Flush(); ferr != nil {
-			slog.WarnContext(r.Context(), "flush query response", "error", ferr)
-		}
-		return
 	} else {
-		var stats *shrimptypes.QueryStats
 		stats, err = s.lsm.QueryStreamWithStats(r.Context(), from, to, term, emit)
 		if err != nil {
-			slog.WarnContext(r.Context(), "stream query", "error", err)
+			slog.WarnContext(r.Context(), "query stream", "error", err)
 		}
+	}
 
-		_, _ = bw.WriteString(`],"stats":`)
-		if statsBytes, merr := json.Marshal(stats); merr == nil {
-			_, _ = bw.Write(statsBytes)
-		} else {
-			_, _ = bw.WriteString(`null`)
+	_, _ = bw.WriteString(`],"stats":`)
+	jw.Reset()
+	writeQueryStatsJSON(jw, stats)
+	_, _ = bw.Write(jw.Buf)
+	_, _ = bw.WriteString(`}`)
+	if ferr := bw.Flush(); ferr != nil {
+		slog.WarnContext(r.Context(), "flush query response", "error", ferr)
+	}
+}
+
+func writeEntryJSON(jw *jx.Writer, e shrimptypes.Entry) {
+	jw.ObjStart()
+	jw.FieldStart("timestamp")
+	jw.Int64(e.Timestamp)
+	jw.Comma()
+	jw.FieldStart("data")
+	jw.Str(e.Data)
+	jw.ObjEnd()
+}
+
+func decodeIngestEntries(d *jx.Decoder, emit func(shrimptypes.Entry) error) error {
+	return d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+		if string(key) != "data" {
+			return d.Skip()
 		}
-		_, _ = bw.WriteString(`}`)
-		if ferr := bw.Flush(); ferr != nil {
-			slog.WarnContext(r.Context(), "flush query response", "error", ferr)
+		return d.Arr(func(d *jx.Decoder) error {
+			e, err := decodeEntryJSON(d)
+			if err != nil {
+				return err
+			}
+			return emit(e)
+		})
+	})
+}
+
+func decodeEntryJSON(d *jx.Decoder) (shrimptypes.Entry, error) {
+	var e shrimptypes.Entry
+	err := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+		switch string(key) {
+		case "timestamp":
+			v, err := d.Int64()
+			if err != nil {
+				return err
+			}
+			e.Timestamp = v
+		case "data":
+			v, err := d.Str()
+			if err != nil {
+				return err
+			}
+			e.Data = v
+		default:
+			return d.Skip()
 		}
+		return nil
+	})
+	return e, err
+}
+
+func writeOTLPLogRecordJSON(
+	jw *jx.Writer,
+	record plog.LogRecord,
+	resource map[string]any,
+	scope pcommon.InstrumentationScope,
+) error {
+	bodyVal := record.Body().AsRaw()
+	attrMap := record.Attributes().AsRaw()
+	sMap := scope.Attributes().AsRaw()
+
+	var traceIDHex string
+	if !record.TraceID().IsEmpty() {
+		traceIDHex = record.TraceID().String()
+	}
+	var spanIDHex string
+	if !record.SpanID().IsEmpty() {
+		spanIDHex = record.SpanID().String()
+	}
+
+	jw.Reset()
+	jw.ObjStart()
+	firstField := true
+	field := func(name string) {
+		if !firstField {
+			jw.Comma()
+		}
+		firstField = false
+		jw.FieldStart(name)
+	}
+
+	field("timestamp")
+	jw.UInt64(uint64(record.Timestamp()))
+
+	if observed := uint64(record.ObservedTimestamp()); observed != 0 {
+		field("observed_timestamp")
+		jw.UInt64(observed)
+	}
+	if severity := int32(record.SeverityNumber()); severity != 0 {
+		field("severity_number")
+		jw.Int32(severity)
+	}
+	if severityText := record.SeverityText(); severityText != "" {
+		field("severity_text")
+		jw.Str(severityText)
+	}
+	if bodyVal != nil {
+		field("body")
+		if err := writeJSONAny(jw, bodyVal); err != nil {
+			return fmt.Errorf("encode body: %w", err)
+		}
+	}
+	if len(attrMap) != 0 {
+		field("attributes")
+		if err := writeJSONAny(jw, attrMap); err != nil {
+			return fmt.Errorf("encode attributes: %w", err)
+		}
+	}
+	if traceIDHex != "" {
+		field("trace_id")
+		jw.Str(traceIDHex)
+	}
+	if spanIDHex != "" {
+		field("span_id")
+		jw.Str(spanIDHex)
+	}
+	if flags := uint32(record.Flags()); flags != 0 {
+		field("flags")
+		jw.UInt32(flags)
+	}
+	if len(resource) != 0 {
+		field("resource")
+		if err := writeJSONAny(jw, resource); err != nil {
+			return fmt.Errorf("encode resource: %w", err)
+		}
+	}
+
+	field("scope")
+	jw.ObjStart()
+	scopeFirst := true
+	scopeField := func(name string) {
+		if !scopeFirst {
+			jw.Comma()
+		}
+		scopeFirst = false
+		jw.FieldStart(name)
+	}
+	if name := scope.Name(); name != "" {
+		scopeField("name")
+		jw.Str(name)
+	}
+	if version := scope.Version(); version != "" {
+		scopeField("version")
+		jw.Str(version)
+	}
+	if len(sMap) != 0 {
+		scopeField("attributes")
+		if err := writeJSONAny(jw, sMap); err != nil {
+			return fmt.Errorf("encode scope attributes: %w", err)
+		}
+	}
+	jw.ObjEnd()
+	jw.ObjEnd()
+
+	if !jx.Valid(jw.Buf) {
+		return fmt.Errorf("invalid JSON produced")
+	}
+
+	return nil
+}
+
+func decodeMatcherQuery(qstr string) (shrimpfilter.Matcher, error) {
+	var qf struct {
+		Line []struct {
+			Op string `json:"op"`
+			V  string `json:"v"`
+		} `json:"line"`
+		Labels []struct {
+			L  string `json:"l"`
+			Op string `json:"op"`
+			V  string `json:"v"`
+		} `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(qstr), &qf); err != nil {
+		return shrimpfilter.Matcher{}, fmt.Errorf("bad q: %w", err)
+	}
+
+	lines := make([]shrimpfilter.LineFilter, 0, len(qf.Line))
+	for _, lf := range qf.Line {
+		op, ok := parseLineOp(lf.Op)
+		if !ok {
+			return shrimpfilter.Matcher{}, fmt.Errorf("bad line op: %s", lf.Op)
+		}
+		lines = append(lines, shrimpfilter.LineFilter{Op: op, Value: lf.V})
+	}
+
+	labels := make([]shrimpfilter.LabelFilter, 0, len(qf.Labels))
+	for _, lf := range qf.Labels {
+		op, ok := parseLabelOp(lf.Op)
+		if !ok {
+			return shrimpfilter.Matcher{}, fmt.Errorf("bad label op: %s", lf.Op)
+		}
+		labels = append(labels, shrimpfilter.LabelFilter{Label: lf.L, Op: op, Value: lf.V})
+	}
+
+	m, err := shrimpfilter.CompileMatcher(lines, labels)
+	if err != nil {
+		return shrimpfilter.Matcher{}, fmt.Errorf("bad matcher: %w", err)
+	}
+
+	return m, nil
+}
+
+func writeJSONAny(jw *jx.Writer, v any) error {
+	switch x := v.(type) {
+	case nil:
+		jw.Null()
+		return nil
+	case bool:
+		jw.Bool(x)
+		return nil
+	case string:
+		jw.Str(x)
+		return nil
+	case []byte:
+		jw.Base64(x)
+		return nil
+	case float32:
+		if math.IsNaN(float64(x)) || math.IsInf(float64(x), 0) {
+			return fmt.Errorf("unsupported float32 value")
+		}
+		jw.Float32(x)
+		return nil
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return fmt.Errorf("unsupported float64 value")
+		}
+		jw.Float64(x)
+		return nil
+	case int:
+		jw.Int(x)
+		return nil
+	case int8:
+		jw.Int8(x)
+		return nil
+	case int16:
+		jw.Int16(x)
+		return nil
+	case int32:
+		jw.Int32(x)
+		return nil
+	case int64:
+		jw.Int64(x)
+		return nil
+	case uint:
+		jw.UInt(x)
+		return nil
+	case uint8:
+		jw.UInt8(x)
+		return nil
+	case uint16:
+		jw.UInt16(x)
+		return nil
+	case uint32:
+		jw.UInt32(x)
+		return nil
+	case uint64:
+		jw.UInt64(x)
+		return nil
+	case map[string]any:
+		jw.ObjStart()
+		first := true
+		for k, v := range x {
+			if !first {
+				jw.Comma()
+			}
+			first = false
+			jw.FieldStart(k)
+			if err := writeJSONAny(jw, v); err != nil {
+				return err
+			}
+		}
+		jw.ObjEnd()
+		return nil
+	case []any:
+		jw.ArrStart()
+		for i, v := range x {
+			if i != 0 {
+				jw.Comma()
+			}
+			if err := writeJSONAny(jw, v); err != nil {
+				return err
+			}
+		}
+		jw.ArrEnd()
+		return nil
+	default:
+		return fmt.Errorf("unsupported JSON type %T", x)
+	}
+}
+
+func writeQueryStatsJSON(jw *jx.Writer, stats *shrimptypes.QueryStats) {
+	if stats == nil {
+		jw.Null()
 		return
 	}
+
+	jw.ObjStart()
+	jw.FieldStart("parts_total")
+	jw.Int(stats.PartsTotal)
+	jw.Comma()
+	jw.FieldStart("parts_pruned_by_ts")
+	jw.Int(stats.PartsPrunedByTS)
+	jw.Comma()
+	jw.FieldStart("parts_pruned_by_index")
+	jw.Int(stats.PartsPrunedByIndex)
+	jw.Comma()
+	jw.FieldStart("parts_scanned")
+	jw.Int(stats.PartsScanned)
+	jw.Comma()
+	jw.FieldStart("blocks_total")
+	jw.Int(stats.BlocksTotal)
+	jw.Comma()
+	jw.FieldStart("blocks_pruned_by_ts")
+	jw.Int(stats.BlocksPrunedByTS)
+	jw.Comma()
+	jw.FieldStart("blocks_pruned_by_index")
+	jw.Int(stats.BlocksPrunedByIndex)
+	jw.Comma()
+	jw.FieldStart("blocks_scanned")
+	jw.Int(stats.BlocksScanned)
+	jw.Comma()
+	jw.FieldStart("entries_scanned")
+	jw.Int(stats.EntriesScanned)
+	jw.Comma()
+	jw.FieldStart("entries_matched")
+	jw.Int(stats.EntriesMatched)
+	jw.Comma()
+	jw.FieldStart("used_index")
+	jw.Bool(stats.UsedIndex)
+	jw.Comma()
+	jw.FieldStart("duration_ms")
+	jw.Int64(stats.DurationMs)
+	jw.ObjEnd()
 }
 
 func parseLineOp(s string) (shrimpfilter.LineOp, bool) {

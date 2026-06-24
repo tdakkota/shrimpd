@@ -48,27 +48,27 @@ outer:
 
 // Block is the wire and file format for a collection of entries.
 type Block struct {
-	SourceReplica string   `json:"source_replica,omitempty"`
-	CreatedAt     int64    `json:"created_at,omitempty"`
-	SourceBlocks  []string `json:"source_blocks,omitempty"`
-	Data          []Entry  `json:"data"`
+	SourceReplica string      `json:"source_replica,omitempty"`
+	CreatedAt     int64       `json:"created_at,omitempty"`
+	SourceBlocks  []string    `json:"source_blocks,omitempty"`
+	Data          []Entry     `json:"data"`
 	Stats         *QueryStats `json:"stats,omitempty"`
 }
 
 // QueryStats contains basic execution statistics for a query.
 type QueryStats struct {
-	PartsTotal         int   `json:"parts_total"`
-	PartsPrunedByTS    int   `json:"parts_pruned_by_ts"`
-	PartsPrunedByIndex int   `json:"parts_pruned_by_index"`
-	PartsScanned       int   `json:"parts_scanned"`
+	PartsTotal         int `json:"parts_total"`
+	PartsPrunedByTS    int `json:"parts_pruned_by_ts"`
+	PartsPrunedByIndex int `json:"parts_pruned_by_index"`
+	PartsScanned       int `json:"parts_scanned"`
 
-	BlocksTotal         int   `json:"blocks_total"`
-	BlocksPrunedByTS    int   `json:"blocks_pruned_by_ts"`
-	BlocksPrunedByIndex int   `json:"blocks_pruned_by_index"`
-	BlocksScanned       int   `json:"blocks_scanned"`
+	BlocksTotal         int `json:"blocks_total"`
+	BlocksPrunedByTS    int `json:"blocks_pruned_by_ts"`
+	BlocksPrunedByIndex int `json:"blocks_pruned_by_index"`
+	BlocksScanned       int `json:"blocks_scanned"`
 
-	EntriesScanned int   `json:"entries_scanned"`
-	EntriesMatched int   `json:"entries_matched"`
+	EntriesScanned int `json:"entries_scanned"`
+	EntriesMatched int `json:"entries_matched"`
 
 	UsedIndex  bool  `json:"used_index"`
 	DurationMs int64 `json:"duration_ms"`
