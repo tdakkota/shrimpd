@@ -799,10 +799,10 @@ func TestDaemonIndexE2E(t *testing.T) {
 	addr1, cleanup1 := runDaemon(dataDir)
 	baseURL1 := "http://" + addr1
 
-	// Ingest 2 blocks with different unique terms
+	// Ingest 2 blocks with different unique terms (as labeled JSON so label-only FST produces entries).
 	postJSON(ctx, t, baseURL1+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
-		{Timestamp: 100, Data: "uniqueapple logs message"},
-		{Timestamp: 200, Data: "uniquebanana logs message"},
+		{Timestamp: 100, Data: `{"resource":{"service.name":"svc"},"body":"uniqueapple logs message"}`},
+		{Timestamp: 200, Data: `{"resource":{"service.name":"svc"},"body":"uniquebanana logs message"}`},
 	}})
 	postJSON(ctx, t, baseURL1+"/flush", nil)
 
@@ -844,11 +844,11 @@ func TestDaemonIndexE2E(t *testing.T) {
 	}
 	waitIndexFiles("after flush")
 
-	// Query using unique term
+	// Query using unique term (data is stored as labeled JSON; match full payload).
 	var qApple shrimptypes.Block
 	getJSON(ctx, t, baseURL1+"/query?from=100&to=200&term=uniqueapple", &qApple)
 	must.Len(qApple.Data, 1)
-	must.Equal("uniqueapple logs message", qApple.Data[0].Data)
+	must.Equal(`{"resource":{"service.name":"svc"},"body":"uniqueapple logs message"}`, qApple.Data[0].Data)
 
 	cleanup1()
 
@@ -867,12 +867,12 @@ func TestDaemonIndexE2E(t *testing.T) {
 	var qBanana shrimptypes.Block
 	getJSON(ctx, t, baseURL2+"/query?from=100&to=200&term=uniquebanana", &qBanana)
 	must.Len(qBanana.Data, 1)
-	must.Equal("uniquebanana logs message", qBanana.Data[0].Data)
+	must.Equal(`{"resource":{"service.name":"svc"},"body":"uniquebanana logs message"}`, qBanana.Data[0].Data)
 
 	// 3. Compaction test
-	// Ingest more logs to create another L0 part
+	// Ingest more logs to create another L0 part (labeled JSON for label-only FST).
 	postJSON(ctx, t, baseURL2+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
-		{Timestamp: 300, Data: "uniquecherry logs message"},
+		{Timestamp: 300, Data: `{"resource":{"service.name":"svc"},"body":"uniquecherry logs message"}`},
 	}})
 	postJSON(ctx, t, baseURL2+"/flush", nil)
 	postJSON(ctx, t, baseURL2+"/compact", nil)
@@ -881,7 +881,7 @@ func TestDaemonIndexE2E(t *testing.T) {
 	var qCherry shrimptypes.Block
 	getJSON(ctx, t, baseURL2+"/query?from=100&to=400&term=uniquecherry", &qCherry)
 	must.Len(qCherry.Data, 1)
-	must.Equal("uniquecherry logs message", qCherry.Data[0].Data)
+	must.Equal(`{"resource":{"service.name":"svc"},"body":"uniquecherry logs message"}`, qCherry.Data[0].Data)
 
 	cleanup2()
 }

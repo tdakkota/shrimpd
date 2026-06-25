@@ -44,9 +44,11 @@ func TestGracefulDegradation(t *testing.T) {
 }
 
 func TestBuildIndexEntriesFromPart(t *testing.T) {
+	// Label-only: entries must contain JSON with resource/attributes to produce lbl: tokens.
+	// Avoid top-level "body" to keep label set minimal (ExtractLabels promotes body to label).
 	ents := []shrimptypes.Entry{
-		{Timestamp: 1, Data: "hello world hello"},
-		{Timestamp: 2, Data: "world test"},
+		{Timestamp: 1, Data: `{"resource":{"service.name":"svc"},"attributes":{"level":"info"}}`},
+		{Timestamp: 2, Data: `{"attributes":{"level":"error"}}`},
 	}
 	path := t.TempDir() + "/p.json"
 	_, err := WritePartV2(path, ents)
@@ -56,25 +58,39 @@ func TestBuildIndexEntriesFromPart(t *testing.T) {
 	defer pf.Close()
 
 	got := BuildIndexEntriesFromPart("part-1", pf)
+	// Only label tokens (lbl:...) are produced; no plain text tokens.
 	want := []shrimptypes.IndexEntry{
-		{Token: "hello", DataID: "part-1"},
-		{Token: "test", DataID: "part-1"},
-		{Token: "world", DataID: "part-1"},
+		{Token: "lbl:level=error", DataID: "part-1"},
+		{Token: "lbl:level=info", DataID: "part-1"},
+		{Token: "lbl:service_name=svc", DataID: "part-1"},
 	}
 	require.Equal(t, want, got)
 }
 
 func TestBuildIndexEntries(t *testing.T) {
 	ents := []shrimptypes.Entry{
-		{Timestamp: 1, Data: "hello world hello"},
-		{Timestamp: 2, Data: "world test"},
+		{Timestamp: 1, Data: `{"resource":{"service.name":"svc"},"attributes":{"level":"info"}}`},
+		{Timestamp: 2, Data: `{"attributes":{"level":"info"}}`},
 	}
 	got := BuildIndexEntries("part-1", ents)
-	// Tokens should be "hello", "test", "world" (each once, sorted, mapped to part-1)
 	want := []shrimptypes.IndexEntry{
-		{Token: "hello", DataID: "part-1"},
-		{Token: "test", DataID: "part-1"},
-		{Token: "world", DataID: "part-1"},
+		{Token: "lbl:level=info", DataID: "part-1"},
+		{Token: "lbl:service_name=svc", DataID: "part-1"},
 	}
 	require.Equal(t, want, got)
+}
+
+func TestBuildIndexFSTOrdinalOrderFollowsDataIDOrder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index.fst")
+
+	entries := []shrimptypes.IndexEntry{
+		{Token: "lbl:a=1", DataID: "part-2"},
+		{Token: "lbl:b=1", DataID: "part-1"},
+		{Token: "lbl:b=1", DataID: "part-2"},
+	}
+	dataIDs, err := BuildIndexFST(path, entries)
+	require.NoError(t, err)
+	require.Equal(t, []string{"part-1", "part-2"}, dataIDs)
+	require.FileExists(t, path)
 }

@@ -23,14 +23,14 @@ func TestIndexEngine_LookupAndFlush(t *testing.T) {
 	// Mark covered
 	require.NoError(t, engine.MarkCovered([]string{"part-1"}))
 
-	// Case 2: Lookup in memtable before flush
+	// Case 2: Lookup in memtable before flush (label tokens only)
 	entries := []shrimptypes.IndexEntry{
-		{Token: "hello", DataID: "part-1"},
-		{Token: "world", DataID: "part-1"},
+		{Token: "lbl:msg=hello", DataID: "part-1"},
+		{Token: "lbl:msg=world", DataID: "part-1"},
 	}
 	require.NoError(t, engine.Write(entries))
 
-	matches, complete, err := engine.Lookup(context.Background(), "hello", candidates)
+	matches, complete, err := engine.LookupTokens(context.Background(), []string{"lbl:msg=hello"}, candidates)
 	require.NoError(t, err)
 	require.True(t, complete)
 	require.Contains(t, matches, "part-1")
@@ -39,15 +39,15 @@ func TestIndexEngine_LookupAndFlush(t *testing.T) {
 	require.NoError(t, engine.Flush(context.Background()))
 
 	// Memtable should be empty now, results from flushed part
-	matches2, complete2, err := engine.Lookup(context.Background(), "hello", candidates)
+	matches2, complete2, err := engine.LookupTokens(context.Background(), []string{"lbl:msg=hello"}, candidates)
 	require.NoError(t, err)
 	require.True(t, complete2)
 	require.Contains(t, matches2, "part-1")
 
 	// Check min/max bounds on flushed metadata
 	require.Len(t, engine.parts, 1)
-	require.Equal(t, "hello", engine.parts[0].MinToken)
-	require.Equal(t, "world", engine.parts[0].MaxToken)
+	require.Equal(t, "lbl:msg=hello", engine.parts[0].MinToken)
+	require.Equal(t, "lbl:msg=world", engine.parts[0].MaxToken)
 }
 
 func TestIndexEngine_MultiTokenLookup(t *testing.T) {
@@ -59,26 +59,26 @@ func TestIndexEngine_MultiTokenLookup(t *testing.T) {
 	require.NoError(t, engine.MarkCovered([]string{"part-1", "part-2"}))
 
 	entries := []shrimptypes.IndexEntry{
-		{Token: "hello", DataID: "part-1"},
-		{Token: "world", DataID: "part-1"},
-		{Token: "hello", DataID: "part-2"},
-		{Token: "test", DataID: "part-2"},
+		{Token: "lbl:k=hello", DataID: "part-1"},
+		{Token: "lbl:k=world", DataID: "part-1"},
+		{Token: "lbl:k=hello", DataID: "part-2"},
+		{Token: "lbl:k=test", DataID: "part-2"},
 	}
 	require.NoError(t, engine.Write(entries))
 	require.NoError(t, engine.Flush(context.Background()))
 
 	candidates := []shrimptypes.PartMeta{{ID: "part-1"}, {ID: "part-2"}}
 
-	// Querying "hello" should return both parts
-	m1, c1, err := engine.Lookup(context.Background(), "hello", candidates)
+	// Querying "lbl:k=hello" should return both parts
+	m1, c1, err := engine.LookupTokens(context.Background(), []string{"lbl:k=hello"}, candidates)
 	require.NoError(t, err)
 	require.True(t, c1)
 	require.Len(t, m1, 2)
 	require.Contains(t, m1, "part-1")
 	require.Contains(t, m1, "part-2")
 
-	// Querying "hello world" should only return part-1 (intersection)
-	m2, c2, err := engine.Lookup(context.Background(), "hello world", candidates)
+	// Querying intersection of two label tokens should only return part-1
+	m2, c2, err := engine.LookupTokens(context.Background(), []string{"lbl:k=hello", "lbl:k=world"}, candidates)
 	require.NoError(t, err)
 	require.True(t, c2)
 	require.Len(t, m2, 1)
@@ -93,11 +93,11 @@ func TestIndexEngine_Compaction(t *testing.T) {
 
 	require.NoError(t, engine.MarkCovered([]string{"part-1", "part-2", "part-3"}))
 
-	// Create two L0 index parts
-	require.NoError(t, engine.Write([]shrimptypes.IndexEntry{{Token: "hello", DataID: "part-1"}, {Token: "world", DataID: "part-2"}}))
+	// Create two L0 index parts (label tokens)
+	require.NoError(t, engine.Write([]shrimptypes.IndexEntry{{Token: "lbl:k=hello", DataID: "part-1"}, {Token: "lbl:k=world", DataID: "part-2"}}))
 	require.NoError(t, engine.Flush(context.Background()))
 
-	require.NoError(t, engine.Write([]shrimptypes.IndexEntry{{Token: "hello", DataID: "part-2"}, {Token: "test", DataID: "part-3"}}))
+	require.NoError(t, engine.Write([]shrimptypes.IndexEntry{{Token: "lbl:k=hello", DataID: "part-2"}, {Token: "lbl:k=test", DataID: "part-3"}}))
 	require.NoError(t, engine.Flush(context.Background()))
 
 	require.Len(t, engine.parts, 2)
@@ -113,9 +113,9 @@ func TestIndexEngine_Compaction(t *testing.T) {
 	require.Len(t, engine.parts, 1)
 	require.Equal(t, 1, engine.parts[0].Level)
 
-	// Lookup "test" (which was only in part-3) should not find anything and part-3 should be removed from covered
+	// Lookup "lbl:k=test" (which was only in part-3) should not find anything and part-3 should be removed from covered
 	candidates := []shrimptypes.PartMeta{{ID: "part-1"}, {ID: "part-2"}}
-	m, c, err := engine.Lookup(context.Background(), "test", candidates)
+	m, c, err := engine.LookupTokens(context.Background(), []string{"lbl:k=test"}, candidates)
 	require.NoError(t, err)
 	require.True(t, c)
 	require.Empty(t, m)

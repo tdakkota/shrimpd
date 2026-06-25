@@ -334,5 +334,3 @@ func StreamRowBlockMatcher(pf *PartFileV2, idx int, from, to int64, m shrimpfilt
 		return fn(shrimptypes.Entry{Timestamp: ts, Data: string(data)})
 	})
 }
-
-

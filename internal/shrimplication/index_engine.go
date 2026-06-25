@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +88,17 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 	if err := engine.loadCovered(); err != nil {
 		_ = wal.Close()
 		return nil, fmt.Errorf("load covered: %w", err)
+	}
+
+	// Cleanup stray temp files from previous crashed compactions/flushes.
+	// Collect first, then remove to avoid TOCTOU in WalkDir callback.
+	if ents, _ := os.ReadDir(indexDir); ents != nil {
+		for _, e := range ents {
+			name := e.Name()
+			if strings.HasPrefix(name, ".tmp-index-fst-") || strings.HasPrefix(name, ".tmp-compact-fst-") {
+				_ = os.Remove(filepath.Join(indexDir, name))
+			}
+		}
 	}
 
 	return engine, nil
@@ -270,7 +283,8 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	fstPath := filepath.Join(indexDir, id+".fst")
 	metaPath := filepath.Join(indexDir, id+".meta")
 
-	if err := shrimpblock.BuildIndexFST(fstPath, entries); err != nil {
+	dataIDs, err := shrimpblock.BuildIndexFST(fstPath, entries)
+	if err != nil {
 		e.mem.Write(entries)
 		e.mu.Unlock()
 		return fmt.Errorf("write index fst: %w", err)
@@ -284,6 +298,7 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 		MaxToken:  entries[len(entries)-1].Token,
 		Count:     len(entries),
 		CreatedAt: time.Now().UnixNano(),
+		DataIDs:   dataIDs,
 	}
 
 	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
@@ -304,80 +319,89 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	return nil
 }
 
-// filteringIterator wraps an FSTIterator and skips composite keys whose DataID
-// is not in the active set. Implements vellum.Iterator for use with vellum.Merge.
-type filteringIterator struct {
-	inner  *vellum.FSTIterator
-	active map[string]struct{}
-	currK  []byte
-	currV  uint64
+// compactIterator wraps an FSTIterator, filters by active dataIDs, and remaps
+// 2-byte ordinal suffix from the part's old DataIDs table to the unified new ordinals.
+// Used by Compact for ordinal-interned FSTs.
+type compactIterator struct {
+	inner      *vellum.FSTIterator
+	active     map[string]struct{}
+	oldDataIDs []string          // this part's ordinal -> dataID
+	ordMap     map[uint16]uint16 // old ordinal -> new unified ordinal
+	currK      []byte
+	currV      uint64
 }
 
-func newFilteringIterator(inner *vellum.FSTIterator, active map[string]struct{}) *filteringIterator {
-	fi := &filteringIterator{inner: inner, active: active}
-	fi.advance()
-	return fi
+func newCompactIterator(inner *vellum.FSTIterator, active map[string]struct{}, oldDataIDs []string, ordMap map[uint16]uint16) *compactIterator {
+	ci := &compactIterator{inner: inner, active: active, oldDataIDs: oldDataIDs, ordMap: ordMap}
+	ci.advance()
+	return ci
 }
 
-func (fi *filteringIterator) advance() {
+func (ci *compactIterator) advance() {
 	for {
-		k, v := fi.inner.Current()
+		k, v := ci.inner.Current()
 		if k == nil {
-			fi.currK = nil
+			ci.currK = nil
 			return
 		}
-		_, after, ok := bytes.Cut(k, []byte{'\x00'})
-		if ok {
-			if _, ok := fi.active[string(after)]; ok {
-				fi.currK = append(fi.currK[:0], k...)
-				fi.currV = v
-				return
+		sepIdx := bytes.IndexByte(k, '\x00')
+		if sepIdx >= 0 && len(k)-sepIdx-1 == 2 {
+			oldOrd := binary.BigEndian.Uint16(k[sepIdx+1:])
+			if int(oldOrd) < len(ci.oldDataIDs) {
+				dataID := ci.oldDataIDs[oldOrd]
+				if _, ok := ci.active[dataID]; ok {
+					newOrd := ci.ordMap[oldOrd]
+					ci.currK = append(ci.currK[:0], k[:sepIdx+1]...)
+					ci.currK = binary.BigEndian.AppendUint16(ci.currK, newOrd)
+					ci.currV = v
+					return
+				}
 			}
 		}
-		if err := fi.inner.Next(); err != nil {
-			fi.currK = nil
+		if err := ci.inner.Next(); err != nil {
+			ci.currK = nil
 			return
 		}
 	}
 }
 
-func (fi *filteringIterator) Current() (key []byte, val uint64) {
-	return fi.currK, fi.currV
+func (ci *compactIterator) Current() (key []byte, val uint64) {
+	return ci.currK, ci.currV
 }
 
-func (fi *filteringIterator) Next() error {
-	if fi.currK == nil {
+func (ci *compactIterator) Next() error {
+	if ci.currK == nil {
 		return vellum.ErrIteratorDone
 	}
-	if err := fi.inner.Next(); err != nil {
-		fi.currK = nil
+	if err := ci.inner.Next(); err != nil {
+		ci.currK = nil
 		return err
 	}
-	fi.advance()
-	if fi.currK == nil {
+	ci.advance()
+	if ci.currK == nil {
 		return vellum.ErrIteratorDone
 	}
 	return nil
 }
 
-func (fi *filteringIterator) Seek(key []byte) error {
-	if err := fi.inner.Seek(key); err != nil {
-		fi.currK = nil
+func (ci *compactIterator) Seek(key []byte) error {
+	if err := ci.inner.Seek(key); err != nil {
+		ci.currK = nil
 		return err
 	}
-	fi.advance()
-	if fi.currK == nil {
+	ci.advance()
+	if ci.currK == nil {
 		return vellum.ErrIteratorDone
 	}
 	return nil
 }
 
-func (fi *filteringIterator) Reset(_ *vellum.FST, _, _ []byte, _ vellum.Automaton) error {
-	return errors.New("filteringIterator: Reset not supported")
+func (ci *compactIterator) Reset(_ *vellum.FST, _, _ []byte, _ vellum.Automaton) error {
+	return errors.New("compactIterator: Reset not supported")
 }
 
-func (fi *filteringIterator) Close() error {
-	return fi.inner.Close()
+func (ci *compactIterator) Close() error {
+	return ci.inner.Close()
 }
 
 // Compact merges L0 index parts into a higher-level part using vellum.Merge,
@@ -396,10 +420,44 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		return nil
 	}
 
-	// Open FSTs and create filtering iterators (streaming — O(1) memory per part).
+	// Build unified DataIDs table + old->new ordinal maps. DataIDs stay sorted
+	// so remapped ordinal bytes preserve each iterator's key order.
+	seenDataIDs := make(map[string]struct{})
+	for _, meta := range l0 {
+		for _, did := range meta.DataIDs {
+			if _, ok := activeDataIDs[did]; !ok {
+				continue
+			}
+			seenDataIDs[did] = struct{}{}
+		}
+	}
+	unified := make([]string, 0, len(seenDataIDs))
+	for did := range seenDataIDs {
+		unified = append(unified, did)
+	}
+	slices.Sort(unified)
+	if len(unified) > 1<<16 {
+		return fmt.Errorf("too many data IDs for compacted index FST: %d", len(unified))
+	}
+	unifiedOrd := make(map[string]uint16, len(unified))
+	for i, did := range unified {
+		unifiedOrd[did] = uint16(i)
+	}
+	partOrdMaps := make([]map[uint16]uint16, len(l0))
+	for i, meta := range l0 {
+		m := make(map[uint16]uint16, len(meta.DataIDs))
+		for old, did := range meta.DataIDs {
+			if newOrd, ok := unifiedOrd[did]; ok {
+				m[uint16(old)] = newOrd
+			}
+		}
+		partOrdMaps[i] = m
+	}
+
+	// Open FSTs and create compact iterators (filter + ordinal remap).
 	itrs := make([]vellum.Iterator, 0, len(l0))
 	fsts := make([]*vellum.FST, 0, len(l0))
-	for _, meta := range l0 {
+	for i, meta := range l0 {
 		e.mu.Lock()
 		f, err := e.openFST(meta.ID)
 		e.mu.Unlock()
@@ -421,7 +479,7 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 			return fmt.Errorf("fst iterator for compact %s: %w", meta.ID, err)
 		}
 		if err == nil {
-			itrs = append(itrs, newFilteringIterator(inner, activeDataIDs))
+			itrs = append(itrs, newCompactIterator(inner, activeDataIDs, meta.DataIDs, partOrdMaps[i]))
 			fsts = append(fsts, f)
 		}
 	}
@@ -502,6 +560,7 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		MinToken:  minToken,
 		MaxToken:  maxToken,
 		CreatedAt: time.Now().UnixNano(),
+		DataIDs:   unified,
 	}
 	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
 		_ = os.Remove(fstPath)
@@ -538,7 +597,8 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 }
 
 // lookupToken scans all index parts for a single composite-key prefix
-// (token+"\x00") and collects DataIDs into matches. Must be called with mu RLock held.
+// (token+"\x00"+2-byte-ordinal) and collects DataIDs into matches using interned ordinals.
+// Must be called with mu RLock held.
 func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[string]struct{}) {
 	start := []byte(tok + "\x00")
 	end := []byte(tok + "\x01")
@@ -572,9 +632,12 @@ func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[s
 			if k == nil {
 				break
 			}
-			_, after, ok := bytes.Cut(k, []byte{'\x00'})
-			if ok {
-				matches[string(after)] = struct{}{}
+			sepIdx := bytes.IndexByte(k, '\x00')
+			if sepIdx >= 0 && len(k)-sepIdx-1 == 2 {
+				ord := binary.BigEndian.Uint16(k[sepIdx+1:])
+				if int(ord) < len(part.DataIDs) {
+					matches[part.DataIDs[ord]] = struct{}{}
+				}
 			}
 			if err := itr.Next(); err != nil {
 				break

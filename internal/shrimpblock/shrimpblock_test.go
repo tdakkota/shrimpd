@@ -2,6 +2,7 @@ package shrimpblock
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,16 +79,18 @@ func TestBuildIndexFSTRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "index"), 0o750))
 	entries := []shrimptypes.IndexEntry{
-		{Token: "hello", DataID: "p1"},
-		{Token: "hello", DataID: "p2"},
-		{Token: "world", DataID: "p1"},
+		{Token: "lbl:a=b", DataID: "p1"},
+		{Token: "lbl:a=b", DataID: "p2"},
+		{Token: "lbl:x=y", DataID: "p1"},
 	}
 	path := filepath.Join(dir, "index", "test.fst")
-	require.NoError(t, BuildIndexFST(path, entries))
+	dataIDs, err := BuildIndexFST(path, entries)
+	require.NoError(t, err)
+	require.Equal(t, []string{"p1", "p2"}, dataIDs)
 
-	// prefix scan: all DataIDs for token "hello"
-	start := compositeKey("hello", "")
-	end := []byte("hello\x01")
+	// prefix scan: all ordinals for token "lbl:a=b", resolve via dataIDs table
+	start := compositeKey("lbl:a=b", 0)
+	end := []byte("lbl:a=b\x01")
 	itr, err := openFSTForTest(t, path, start, end)
 	require.NoError(t, err)
 	var got []string
@@ -98,7 +101,10 @@ func TestBuildIndexFSTRoundTrip(t *testing.T) {
 		}
 		sep := bytes.IndexByte(k, '\x00')
 		require.True(t, sep >= 0)
-		got = append(got, string(k[sep+1:]))
+		ord := binary.BigEndian.Uint16(k[sep+1:])
+		if int(ord) < len(dataIDs) {
+			got = append(got, dataIDs[ord])
+		}
 		if err := itr.Next(); err != nil {
 			break
 		}

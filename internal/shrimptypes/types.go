@@ -127,8 +127,6 @@ const (
 // It is used to quickly check whether a token might be present in a block of data.
 type BloomFilter [BloomBytes]byte
 
-
-
 // RowCacheKey is the cache key for BinBlock caching.
 type RowCacheKey struct {
 	PartID string
@@ -148,12 +146,13 @@ type IndexBlock struct {
 
 // IndexPartMeta describes an immutable index part stored on disk.
 type IndexPartMeta struct {
-	ID          string `json:"id"`
-	NodeID      string `json:"node_id"`
-	Level       int    `json:"level"`
-	MinToken    string `json:"min_token"`
-	MaxToken    string `json:"max_token"`
-	Count       int    `json:"count"`
-	CreatedAt   int64  `json:"created_at,omitempty"`
-	Compression string `json:"compression,omitempty"`
+	ID          string   `json:"id"`
+	NodeID      string   `json:"node_id"`
+	Level       int      `json:"level"`
+	MinToken    string   `json:"min_token"`
+	MaxToken    string   `json:"max_token"`
+	Count       int      `json:"count"`
+	CreatedAt   int64    `json:"created_at,omitempty"`
+	Compression string   `json:"compression,omitempty"`
+	DataIDs     []string `json:"data_ids,omitempty"` // ordinal → dataID for interned FST keys
 }

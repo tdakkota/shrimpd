@@ -3,6 +3,7 @@ package shrimpblock
 import (
 	"bytes"
 	"cmp"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,8 +21,8 @@ import (
 // from plain text tokens in the FST composite key space.
 const LabelTokenPrefix = "lbl:"
 
-// BuildIndexEntries tokenizes entries and returns sorted, deduplicated [shrimptypes.IndexEntry]
-// values. Each entry produces both text tokens and label tokens (lbl:key=value).
+// BuildIndexEntries returns sorted, deduplicated [shrimptypes.IndexEntry]
+// values for key/value pairs extracted by shrimpfilter.ExtractLabels.
 func BuildIndexEntries(dataID string, entries []shrimptypes.Entry) []shrimptypes.IndexEntry {
 	seen := make(map[string]struct{})
 	var out []shrimptypes.IndexEntry
@@ -34,9 +35,6 @@ func BuildIndexEntries(dataID string, entries []shrimptypes.Entry) []shrimptypes
 	}
 
 	for _, e := range entries {
-		for tok := range Tokenize(e.Data) {
-			add(tok)
-		}
 		labels := shrimpfilter.ExtractLabels(e.Data)
 		for k, v := range labels {
 			add(LabelTokenPrefix + k + "=" + v)
@@ -52,8 +50,8 @@ func BuildIndexEntries(dataID string, entries []shrimptypes.Entry) []shrimptypes
 	return out
 }
 
-// BuildIndexEntriesFromPart walks a V2 part file and returns index entries without
-// materializing a full []Entry slice. One transient string per row for Tokenize/ExtractLabels.
+// BuildIndexEntriesFromPart walks a V2 part file and returns key/value index entries
+// without materializing a full []Entry slice.
 func BuildIndexEntriesFromPart(dataID string, pf *PartFileV2) []shrimptypes.IndexEntry {
 	seen := make(map[string]struct{})
 	var out []shrimptypes.IndexEntry
@@ -72,9 +70,6 @@ func BuildIndexEntriesFromPart(dataID string, pf *PartFileV2) []shrimptypes.Inde
 		}
 		for i := range bb.TS {
 			s := string(bb.DataBytes(i))
-			for tok := range Tokenize(s) {
-				add(tok)
-			}
 			labels := shrimpfilter.ExtractLabels(s)
 			for k, v := range labels {
 				add(LabelTokenPrefix + k + "=" + v)
@@ -91,21 +86,41 @@ func BuildIndexEntriesFromPart(dataID string, pf *PartFileV2) []shrimptypes.Inde
 	return out
 }
 
-// compositeKey builds the FST composite key: token + "\x00" + dataID.
-func compositeKey(token, dataID string) []byte {
-	key := make([]byte, len(token)+1+len(dataID))
+// compositeKey builds the FST composite key: token + "\x00" + 2-byte big-endian ordinal.
+func compositeKey(token string, ordinal uint16) []byte {
+	key := make([]byte, len(token)+1+2)
 	copy(key, token)
 	key[len(token)] = '\x00'
-	copy(key[len(token)+1:], dataID)
+	binary.BigEndian.PutUint16(key[len(token)+1:], ordinal)
 	return key
 }
 
 // BuildIndexFST writes a vellum FST from sorted (token, dataID) pairs to path,
 // using a temp-file + atomic rename. entries must be sorted by (Token, DataID).
-func BuildIndexFST(path string, entries []shrimptypes.IndexEntry) error {
+// It interns DataIDs to uint16 ordinals and returns the DataIDs table (ordinal -> dataID).
+func BuildIndexFST(path string, entries []shrimptypes.IndexEntry) ([]string, error) {
+	// DataID ordinals must sort the same way as DataIDs because entries are
+	// inserted in (Token, DataID) order and vellum requires sorted keys.
+	seenDataIDs := make(map[string]struct{})
+	for _, e := range entries {
+		seenDataIDs[e.DataID] = struct{}{}
+	}
+	dataIDs := make([]string, 0, len(seenDataIDs))
+	for dataID := range seenDataIDs {
+		dataIDs = append(dataIDs, dataID)
+	}
+	slices.Sort(dataIDs)
+	if len(dataIDs) > 1<<16 {
+		return nil, fmt.Errorf("too many data IDs for index FST: %d", len(dataIDs))
+	}
+	ord := make(map[string]uint16, len(dataIDs))
+	for i, dataID := range dataIDs {
+		ord[dataID] = uint16(i)
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-index-fst-")
 	if err != nil {
-		return fmt.Errorf("create fst temp: %w", err)
+		return nil, fmt.Errorf("create fst temp: %w", err)
 	}
 	tmpName := tmp.Name()
 
@@ -113,19 +128,20 @@ func BuildIndexFST(path string, entries []shrimptypes.IndexEntry) error {
 	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("new fst builder: %w", err)
+		return nil, fmt.Errorf("new fst builder: %w", err)
 	}
 
 	var prevKey []byte
 	for _, e := range entries {
-		key := compositeKey(e.Token, e.DataID)
+		o := ord[e.DataID]
+		key := compositeKey(e.Token, o)
 		if bytes.Equal(key, prevKey) {
 			continue // skip exact duplicates
 		}
 		if err := builder.Insert(key, 0); err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(tmpName)
-			return fmt.Errorf("fst insert %q: %w", key, err)
+			return nil, fmt.Errorf("fst insert %q: %w", key, err)
 		}
 		prevKey = key
 	}
@@ -133,22 +149,25 @@ func BuildIndexFST(path string, entries []shrimptypes.IndexEntry) error {
 	if err := builder.Close(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("fst builder close: %w", err)
+		return nil, fmt.Errorf("fst builder close: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return nil, err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return nil, err
 	}
-	return fsyncutil.SyncDir(filepath.Dir(path))
+	if err := fsyncutil.SyncDir(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	return dataIDs, nil
 }
 
 // ReadIndexMeta reads the index metadata from the specified path.

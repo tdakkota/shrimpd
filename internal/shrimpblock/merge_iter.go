@@ -90,12 +90,12 @@ func MergeParts(parts []*PartFileV2) iter.Seq2[shrimptypes.Entry, error] {
 			}
 		}
 		heap.Init(&h)
-	for h.Len() > 0 {
-		c := h[0]
-		entry := shrimptypes.Entry{Timestamp: c.ts, Data: string(c.bb.DataBytes(c.idx))}
-		if !yield(entry, nil) {
-			return
-		}
+		for h.Len() > 0 {
+			c := h[0]
+			entry := shrimptypes.Entry{Timestamp: c.ts, Data: string(c.bb.DataBytes(c.idx))}
+			if !yield(entry, nil) {
+				return
+			}
 			next, err := advanceCursor(c)
 			if err != nil {
 				yield(shrimptypes.Entry{}, fmt.Errorf("advance part %d block %d: %w", c.part, c.block, err))

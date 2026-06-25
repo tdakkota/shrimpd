@@ -46,34 +46,14 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 	}
 	normalizedTerm := strings.ToLower(term)
 
-	// Step 2-4: Filter by index or fall back to old behavior
-	useIndexFilter := false
-	var indexedPartIDs map[string]struct{}
-	if normalizedTerm != "" {
-		matches, complete, err := l.idxEngine.Lookup(ctx, normalizedTerm, timeParts)
-		if err != nil {
-			slog.WarnContext(ctx, "index lookup failed, falling back to scanning", "error", err)
-		} else if complete {
-			useIndexFilter = true
-			indexedPartIDs = matches
-			stats.UsedIndex = true
-		}
-	}
-
+	// Text terms are pruned via PartMeta.Tokens (HasToken) + block bloom.
+	// Label terms use FST via LookupTokens in QueryMatcherWithStats.
 	result := make([]shrimptypes.Entry, 0)
 	for _, meta := range timeParts {
-		if useIndexFilter {
-			if _, matched := indexedPartIDs[meta.ID]; !matched {
-				stats.PartsPrunedByIndex++
-				stats.BlocksPrunedByIndex += meta.BlockCount
-				continue
-			}
-		} else {
-			if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
-				stats.PartsPrunedByIndex++
-				stats.BlocksPrunedByIndex += meta.BlockCount
-				continue
-			}
+		if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
+			stats.PartsPrunedByIndex++
+			stats.BlocksPrunedByIndex += meta.BlockCount
+			continue
 		}
 		stats.PartsScanned++
 
@@ -163,35 +143,15 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 	}
 	normalizedTerm := strings.ToLower(term)
 
-	useIndexFilter := false
-	var indexedPartIDs map[string]struct{}
-	if normalizedTerm != "" {
-		matches, complete, err := l.idxEngine.Lookup(ctx, normalizedTerm, timeParts)
-		if err != nil {
-			slog.WarnContext(ctx, "index lookup failed, falling back to scanning", "error", err)
-		} else if complete {
-			useIndexFilter = true
-			indexedPartIDs = matches
-			stats.UsedIndex = true
-		}
-	}
-
+	// Text pruning via HasToken (Tokens) + bloom; labels use FST via LookupTokens.
 	for _, meta := range timeParts {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
 		}
-		if useIndexFilter {
-			if _, matched := indexedPartIDs[meta.ID]; !matched {
-				stats.PartsPrunedByIndex++
-				stats.BlocksPrunedByIndex += meta.BlockCount
-				continue
-			}
-		} else {
-			if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
-				stats.PartsPrunedByIndex++
-				stats.BlocksPrunedByIndex += meta.BlockCount
-				continue
-			}
+		if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
+			stats.PartsPrunedByIndex++
+			stats.BlocksPrunedByIndex += meta.BlockCount
+			continue
 		}
 		stats.PartsScanned++
 

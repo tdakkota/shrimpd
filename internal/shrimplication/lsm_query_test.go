@@ -123,6 +123,44 @@ func TestLSM_QueryWithStats_Memtable(t *testing.T) {
 	require.GreaterOrEqual(t, stats.DurationMs, int64(0))
 }
 
+func TestLSM_QueryWithStats_EmptyPartTokensFallbackScansPart(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "parts"), 0o755))
+	wal, err := shrimpwal.OpenWAL(dir + "/wal.jsonl")
+	require.NoError(t, err)
+	defer wal.Close()
+
+	lsm, err := NewLSM("n1", "127.0.0.1:0", dir, wal, NewRegistry(nil, "n1"))
+	require.NoError(t, err)
+	defer lsm.Close()
+
+	entries := []shrimptypes.Entry{
+		{Timestamp: 10, Data: "hello replicated part"},
+		{Timestamp: 20, Data: "other line"},
+	}
+	partID := "remote-part"
+	headers, err := shrimpblock.WritePartV2(filepath.Join(dir, "parts", partID+".json"), entries)
+	require.NoError(t, err)
+
+	lsm.parts = []shrimptypes.PartMeta{{
+		ID:            partID,
+		NodeID:        "n2",
+		MinTimestamp:  10,
+		MaxTimestamp:  20,
+		Count:         len(entries),
+		Tokens:        []string{},
+		FormatVersion: 1,
+		BlockCount:    len(headers),
+	}}
+
+	got, stats, err := lsm.QueryWithStats(context.Background(), 0, 100, "hello")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, int64(10), got[0].Timestamp)
+	require.Equal(t, 1, stats.PartsScanned)
+	require.Zero(t, stats.PartsPrunedByIndex)
+}
+
 func TestQueryMatcherLabelBloomPruning(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "parts"), 0o755))
