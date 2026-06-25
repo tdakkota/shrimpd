@@ -48,6 +48,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/tdakkota/shrimpd/internal/shrimpapi"
 	"github.com/tdakkota/shrimpd/internal/shrimplication"
 	shrimpwal "github.com/tdakkota/shrimpd/internal/shrimpwal"
@@ -59,6 +60,33 @@ import (
 	"go.opentelemetry.io/otel/sdk/log"
 	"golang.org/x/sync/errgroup"
 )
+
+// bytesFlag is a custom flag type that allows human-readable byte sizes (e.g., "10MB") to be parsed into uint64 values.
+type bytesFlag uint64
+
+func BytesFlag(name, value, usage string) *bytesFlag {
+	b := bytesFlag(0)
+	if err := b.Set(value); err != nil {
+		panic(fmt.Sprintf("invalid default value for %s: %v", name, err))
+	}
+	flag.Var(&b, name, usage)
+	return &b
+}
+
+// String implements flag.Value interface, returning the value as a string.
+func (b *bytesFlag) String() string {
+	return humanize.Bytes(uint64(*b))
+}
+
+// Set implements flag.Value interface, allowing human-readable byte sizes like "10MB".
+func (b *bytesFlag) Set(s string) error {
+	v, err := humanize.ParseBytes(s)
+	if err != nil {
+		return err
+	}
+	*b = bytesFlag(v)
+	return nil
+}
 
 func main() {
 	var (
@@ -72,14 +100,14 @@ func main() {
 		cpuProfile         = flag.String("cpuprofile", "", "write CPU profile to file on exit")
 		memProfileDir      = flag.String("memprofile-dir", "", "directory to write heap profiles; empty = disabled")
 		memProfileInterval = flag.Duration("memprofile-interval", 30*time.Second, "how often to poll heap usage for threshold check")
-		memProfileThresh   = flag.Int64("memprofile-threshold", 0, "auto-dump heap profile when HeapInuse exceeds this many bytes (0 = disabled)")
-		memLimit           = flag.Int64("memlimit", 0, "soft memory limit in bytes passed to runtime/debug.SetMemoryLimit (0 = runtime default); also respects GOMEMLIMIT env var")
+		memProfileThresh   = BytesFlag("memprofile-threshold", "0", "auto-dump heap profile when HeapInuse exceeds this many bytes (0 = disabled)")
+		memLimit           = BytesFlag("memlimit", "0", "soft memory limit in bytes passed to runtime/debug.SetMemoryLimit (0 = runtime default); also respects GOMEMLIMIT env var")
 	)
 	flag.Parse()
 
 	// Apply soft memory limit before anything allocates.
 	if *memLimit > 0 {
-		prev := debug.SetMemoryLimit(*memLimit)
+		prev := debug.SetMemoryLimit(int64(*memLimit))
 		slog.Info("set memory limit", "bytes", *memLimit, "previous", prev)
 	}
 
@@ -181,7 +209,7 @@ func main() {
 			slog.Error("create memprofile dir", "error", err)
 			os.Exit(1)
 		}
-		go heapMonitor(ctx, *memProfileDir, *memProfileThresh, *memProfileInterval)
+		go heapMonitor(ctx, *memProfileDir, uint64(*memProfileThresh), *memProfileInterval)
 	}
 
 	eg, ctx := errgroup.WithContext(ctx)
@@ -196,7 +224,7 @@ func main() {
 // heapMonitor polls heap stats and writes a heap profile when HeapInuse exceeds
 // threshold, and on SIGUSR1. Profiles land in dir as heap-<timestamp>.pprof.
 // A zero threshold disables the automatic dump; SIGUSR1 always works.
-func heapMonitor(ctx context.Context, dir string, threshold int64, interval time.Duration) {
+func heapMonitor(ctx context.Context, dir string, threshold uint64, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -247,7 +275,7 @@ func heapMonitor(ctx context.Context, dir string, threshold int64, interval time
 			}
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
-			if int64(ms.HeapInuse) >= threshold {
+			if ms.HeapInuse >= threshold {
 				dump(fmt.Sprintf("threshold(%dMiB)", threshold>>20))
 			}
 		}
