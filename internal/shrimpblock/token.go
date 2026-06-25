@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // Tokenize splits a string into lowercase tokens, using non-letter and non-number characters as delimiters.

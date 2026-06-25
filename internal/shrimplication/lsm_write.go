@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/fsyncutil"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // Write is safe for concurrent use. Durable after WAL fsync.

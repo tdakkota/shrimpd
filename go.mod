@@ -1,4 +1,4 @@
-module github.com/tdakkota/shrimpd
+module github.com/oteldb/shrimpd
 
 go 1.26.0
 

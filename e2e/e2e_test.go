@@ -21,10 +21,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpapi"
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
-	"github.com/tdakkota/shrimpd/internal/shrimpwal"
+	"github.com/oteldb/shrimpd/internal/shrimpapi"
+	"github.com/oteldb/shrimpd/internal/shrimplication"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpwal"
 )
 
 func TestDaemonSmoke(t *testing.T) {

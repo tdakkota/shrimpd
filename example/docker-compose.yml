@@ -22,7 +22,7 @@ services:
           memory: 1024M
   gateway:
     build: ..
-    image: tdakkota/shrimpd:latest
+    image: oteldb/shrimpd:latest
     entrypoint: [ "/shrimpgateway" ]
     command:
       - -addr=:8080
@@ -43,7 +43,7 @@ services:
           memory: 128M
   shrimpd-1:
     build: ..
-    image: tdakkota/shrimpd:latest
+    image: oteldb/shrimpd:latest
     environment:
       - OTEL_LOGS_EXPORTER=none
     command:
@@ -72,7 +72,7 @@ services:
           memory: 4G
   shrimpd-2:
     build: ..
-    image: tdakkota/shrimpd:latest
+    image: oteldb/shrimpd:latest
     environment:
       - OTEL_LOGS_EXPORTER=none
     command:
@@ -101,7 +101,7 @@ services:
           memory: 4G
   shrimpd-3:
     build: ..
-    image: tdakkota/shrimpd:latest
+    image: oteldb/shrimpd:latest
     environment:
       - OTEL_LOGS_EXPORTER=none
     command:

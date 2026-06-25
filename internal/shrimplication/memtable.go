@@ -5,8 +5,8 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpfilter"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // MemTable is the in-memory write buffer. Drained atomically by flush,

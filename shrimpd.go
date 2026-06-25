@@ -1,7 +1,7 @@
 // Package shrimpd is the root package for the shrimpd library.
 package shrimpd
 
-import "github.com/tdakkota/shrimpd/internal/shrimpfilter"
+import "github.com/oteldb/shrimpd/internal/shrimpfilter"
 
 type (
 	// LineOp is the operation type for line filters.

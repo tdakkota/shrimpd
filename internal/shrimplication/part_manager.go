@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // PartManager owns open [shrimpblock.PartFileV2] instances for the lifetime of the active set.

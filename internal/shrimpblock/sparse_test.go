@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 func TestBuildSparseFromPart(t *testing.T) {

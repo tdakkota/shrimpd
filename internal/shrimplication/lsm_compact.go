@@ -7,8 +7,8 @@ import (
 	"os"
 	"slices"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // Compact forces compaction of data parts and then compacts the index, removing

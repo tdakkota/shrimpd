@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/fsyncutil"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // BuildSparse builds a sparse index from a list of entries, sampling every `every` entries.

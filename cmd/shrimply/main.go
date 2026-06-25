@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 type otlpScopeJSON struct {

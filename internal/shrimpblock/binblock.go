@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpfilter"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // BinBlock is a view over a decompressed binary block buffer.

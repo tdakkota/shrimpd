@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/fsyncutil"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // ReadBlock reads a [Block] from a local part file (V2 binary or legacy JSON).

@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpfilter"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 func TestEncodeDecodeBinBlock_RoundTrip(t *testing.T) {

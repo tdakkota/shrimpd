@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 type blockCursor struct {

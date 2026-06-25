@@ -56,9 +56,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/log"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpapi"
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	shrimpwal "github.com/tdakkota/shrimpd/internal/shrimpwal"
+	"github.com/oteldb/shrimpd/internal/shrimpapi"
+	"github.com/oteldb/shrimpd/internal/shrimplication"
+	shrimpwal "github.com/oteldb/shrimpd/internal/shrimpwal"
 )
 
 // bytesFlag is a custom flag type that allows human-readable byte sizes (e.g., "10MB") to be parsed into uint64 values.

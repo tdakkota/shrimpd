@@ -10,9 +10,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
-	"github.com/tdakkota/shrimpd/internal/shrimpwal"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpwal"
 )
 
 func newTestLSM(t *testing.T) (*LSM, *stubRegistry, string) {

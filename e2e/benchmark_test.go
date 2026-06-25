@@ -11,9 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
-	"github.com/tdakkota/shrimpd/internal/shrimpwal"
+	"github.com/oteldb/shrimpd/internal/shrimplication"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpwal"
 )
 
 func setupLSM(b *testing.B, endpoint string) *shrimplication.LSM {

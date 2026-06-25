@@ -4,7 +4,7 @@ package shrimpwal
 import (
 	"github.com/go-faster/jx"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 type (

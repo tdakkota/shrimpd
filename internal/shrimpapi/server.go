@@ -23,9 +23,9 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpfilter"
+	"github.com/oteldb/shrimpd/internal/shrimplication"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // Server serves the daemon HTTP API for ingesting, reading, and sharing parts.

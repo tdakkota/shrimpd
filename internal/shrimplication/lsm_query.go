@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimpfilter"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // Query returns entries within the given timestamp range, optionally filtered by term.

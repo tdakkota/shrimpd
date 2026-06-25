@@ -13,8 +13,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // AllParts returns the copy of current memory parts list.

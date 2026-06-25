@@ -3,7 +3,7 @@ package shrimpblock
 import (
 	"github.com/zeebo/xxh3"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 func bloomSetHash(b *shrimptypes.BloomFilter, h xxh3.Uint128) {

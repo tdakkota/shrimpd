@@ -83,4 +83,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/tdakkota/shrimpd
+        - github.com/oteldb/shrimpd

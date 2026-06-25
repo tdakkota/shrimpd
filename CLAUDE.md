@@ -1,7 +1,7 @@
 # Repository Instructions
 
 ## Project Shape
-- Go module: `github.com/tdakkota/shrimpd`.
+- Go module: `github.com/oteldb/shrimpd`.
 - The root package `shrimpd` re-exports filter types; actual logic lives in `internal/`.
 - Three CLI binaries under `cmd/`: `shrimpd` (server), `shrimply` (query client), `ch2shrimpd` (ingests logs from oteldb).
 - Runtime storage is local JSON part files plus `wal.jsonl`; etcd is the metadata plane for `/lsm/parts/` and `/lsm/nodes/`.

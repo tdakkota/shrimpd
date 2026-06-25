@@ -3,7 +3,7 @@ package shrimplication
 import (
 	"sync"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // IndexMemTable holds unflushed index entries in memory.

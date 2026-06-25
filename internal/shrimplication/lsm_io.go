@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/fsyncutil"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 func (l *LSM) partPath(id string) string {

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
+	"github.com/oteldb/shrimpd/internal/fsyncutil"
 )
 
 // syncFile fsyncs a segment file. It is a package var so tests can inject

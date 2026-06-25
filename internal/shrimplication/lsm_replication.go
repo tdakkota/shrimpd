@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 func (l *LSM) startup(ctx context.Context) error {

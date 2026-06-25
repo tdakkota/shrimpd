@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/oteldb/shrimpd/internal/shrimpblock"
+	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
 // gcLoop periodically fetches the materialized active parts from etcd (/lsm/parts/)
