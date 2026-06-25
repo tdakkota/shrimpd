@@ -326,9 +326,9 @@ func (fi *filteringIterator) advance() {
 			fi.currK = nil
 			return
 		}
-		sep := bytes.IndexByte(k, '\x00')
-		if sep >= 0 {
-			if _, ok := fi.active[string(k[sep+1:])]; ok {
+		_, after, ok := bytes.Cut(k, []byte{'\x00'})
+		if ok {
+			if _, ok := fi.active[string(after)]; ok {
 				fi.currK = append(fi.currK[:0], k...)
 				fi.currV = v
 				return
@@ -341,7 +341,7 @@ func (fi *filteringIterator) advance() {
 	}
 }
 
-func (fi *filteringIterator) Current() ([]byte, uint64) {
+func (fi *filteringIterator) Current() (key []byte, val uint64) {
 	return fi.currK, fi.currV
 }
 
@@ -534,7 +534,7 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 
 // lookupToken scans all index parts for a single composite-key prefix
 // (token+"\x00") and collects DataIDs into matches. Must be called with mu RLock held.
-func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[string]struct{}) error {
+func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[string]struct{}) {
 	start := []byte(tok + "\x00")
 	end := []byte(tok + "\x01")
 
@@ -567,9 +567,9 @@ func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[s
 			if k == nil {
 				break
 			}
-			sep := bytes.IndexByte(k, '\x00')
-			if sep >= 0 {
-				matches[string(k[sep+1:])] = struct{}{}
+			_, after, ok := bytes.Cut(k, []byte{'\x00'})
+			if ok {
+				matches[string(after)] = struct{}{}
 			}
 			if err := itr.Next(); err != nil {
 				break
@@ -577,7 +577,6 @@ func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[s
 		}
 		_ = itr.Close()
 	}
-	return nil
 }
 
 // Lookup queries the index for matching data part IDs by term (text tokens).
@@ -610,9 +609,7 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []shri
 	var finalMatches map[string]struct{}
 	for i, tok := range tokens {
 		matches := make(map[string]struct{})
-		if err := e.lookupToken(ctx, tok, matches); err != nil {
-			return nil, false, err
-		}
+		e.lookupToken(ctx, tok, matches)
 		if i == 0 {
 			finalMatches = matches
 		} else {
@@ -629,7 +626,7 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []shri
 
 // LookupTokens queries the index for matching data part IDs by pre-built tokens
 // (e.g. label tokens like "lbl:service_name=svc-a"). Used by QueryMatcherWithStats.
-func (e *IndexEngine) LookupTokens(ctx context.Context, tokens []string, candidates []shrimptypes.PartMeta) (map[string]struct{}, bool, error) {
+func (e *IndexEngine) LookupTokens(ctx context.Context, tokens []string, candidates []shrimptypes.PartMeta) (matchedIDs map[string]struct{}, complete bool, err error) {
 	if len(tokens) == 0 {
 		return nil, false, nil
 	}
@@ -650,9 +647,7 @@ func (e *IndexEngine) LookupTokens(ctx context.Context, tokens []string, candida
 	var finalMatches map[string]struct{}
 	for i, tok := range tokens {
 		matches := make(map[string]struct{})
-		if err := e.lookupToken(ctx, tok, matches); err != nil {
-			return nil, false, err
-		}
+		e.lookupToken(ctx, tok, matches)
 		if i == 0 {
 			finalMatches = matches
 		} else {

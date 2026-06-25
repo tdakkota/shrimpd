@@ -34,6 +34,7 @@ type registryAPI interface {
 	LogCleanupLoop(ctx context.Context)
 	GetQueuePointer(ctx context.Context) (int64, error)
 	SetQueuePointer(ctx context.Context, index int64) error
+	GetLivePeerAddrs(ctx context.Context, excludeID string) ([]string, error)
 }
 
 // LSM owns local writes, local parts, compaction, and distributed reads.
@@ -62,8 +63,10 @@ type LSM struct {
 	// new part). Unlike the index engine, it is NOT held across flush I/O: the
 	// query path reads the mem+parts union and tolerates a part appearing slightly
 	// later, so there is no in-flight-visibility hazard to protect against.
-	mu    sync.RWMutex
-	parts []shrimptypes.PartMeta // all parts replicated locally, kept in sync with etcd log
+	mu              sync.RWMutex
+	parts           []shrimptypes.PartMeta          // all parts replicated locally, kept in sync with etcd log
+	pendingParts    map[string]shrimptypes.PartMeta // parts whose peer was unreachable at bootstrap; retried periodically
+	pendingAttempts map[string]pendingAttempt       // per-part retry state
 
 	idxEngine *IndexEngine // Separate Index Engine
 
@@ -101,16 +104,18 @@ func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg registryAPI) (
 		Build()
 
 	l := &LSM{
-		nodeID:        nodeID,
-		addr:          addr,
-		dataDir:       dataDir,
-		mem:           &MemTable{},
-		wal:           wal,
-		reg:           reg,
-		flushSig:      make(chan struct{}, 1),
-		idxEngine:     idx,
-		rowBlockCache: rowBlockCache,
-		partMgr:       NewPartManager(dataDir),
+		nodeID:          nodeID,
+		addr:            addr,
+		dataDir:         dataDir,
+		mem:             &MemTable{},
+		wal:             wal,
+		reg:             reg,
+		flushSig:        make(chan struct{}, 1),
+		idxEngine:       idx,
+		rowBlockCache:   rowBlockCache,
+		partMgr:         NewPartManager(dataDir),
+		pendingParts:    make(map[string]shrimptypes.PartMeta),
+		pendingAttempts: make(map[string]pendingAttempt),
 	}
 	// Replay WAL to recover any entries not yet flushed to a part.
 	entries, err := wal.Recover()

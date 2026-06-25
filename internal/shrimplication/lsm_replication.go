@@ -36,9 +36,13 @@ func (l *LSM) startup(ctx context.Context) error {
 			}
 			continue
 		}
-		raw, _, err := fetchRemotePart(meta, remoteHTTP)
+		raw, _, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
 		if err != nil {
-			return fmt.Errorf("bootstrap fetch %s: %w", id, err)
+			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
+			l.mu.Lock()
+			l.pendingParts[id] = meta
+			l.mu.Unlock()
+			continue
 		}
 		if err := writeRawPart(l.partPath(id), raw); err != nil {
 			return err
@@ -116,6 +120,12 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			// Resolve live peers once per tick; used by both pending retry and log
+			// entry replication to avoid an etcd round-trip per log entry.
+			peers, _ := l.reg.GetLivePeerAddrs(ctx, l.nodeID)
+
+			l.retryPendingParts(ctx, peers)
+
 			// Check for log gap after possible truncation
 			if pointer > 0 {
 				exists, err := l.reg.logEntryExists(ctx, pointer+1)
@@ -155,7 +165,7 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 					break
 				}
 
-				if err := l.applyLogEntry(ctx, entry); err != nil {
+				if err := l.applyLogEntry(ctx, entry, peers); err != nil {
 					slog.ErrorContext(ctx, "failed to apply log entry", "index", entry.Index, "op", entry.Op, "error", err)
 					break // Retry from the same pointer next time
 				}
@@ -191,9 +201,13 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 			}
 			continue
 		}
-		raw, _, err := fetchRemotePart(meta, remoteHTTP)
+		raw, _, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
 		if err != nil {
-			return fmt.Errorf("bootstrap fetch failed: %w", err)
+			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
+			l.mu.Lock()
+			l.pendingParts[id] = meta
+			l.mu.Unlock()
+			continue
 		}
 		if err := writeRawPart(l.partPath(id), raw); err != nil {
 			return fmt.Errorf("write part: %w", err)
@@ -207,6 +221,13 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 	}
 	l.mu.Lock()
 	l.parts = loaded
+	// Prune pending parts that are no longer in the snapshot (merged/GC'd).
+	for id := range l.pendingParts {
+		if _, inSnap := snap.Parts[id]; !inSnap {
+			delete(l.pendingParts, id)
+			delete(l.pendingAttempts, id)
+		}
+	}
 	l.mu.Unlock()
 
 	// Reconcile index coverage for all loaded parts.
@@ -233,7 +254,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 	return nil
 }
 
-func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
+func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string) error {
 	if entry.NodeID == l.nodeID {
 		slog.DebugContext(ctx, "skip own log entry", "index", entry.Index, "op", entry.Op)
 		return nil
@@ -242,7 +263,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 	switch entry.Op {
 	case OpPut:
 		slog.InfoContext(ctx, "replicating PUT part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		raw, block, err := fetchRemotePart(entry.Part, remoteHTTP)
+		raw, block, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -278,7 +299,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 
 	case OpMerge:
 		slog.InfoContext(ctx, "replicating MERGE part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		raw, block, err := fetchRemotePart(entry.Part, remoteHTTP)
+		raw, block, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -316,6 +337,12 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 			next = append(next, entry.Part)
 		}
 		l.parts = next
+		// The merged part supersedes all old parts; a pending download of any
+		// old part would resurrect a stale entry and produce duplicate results.
+		for _, id := range entry.OldParts {
+			delete(l.pendingParts, id)
+			delete(l.pendingAttempts, id)
+		}
 		l.mu.Unlock()
 
 		if err := l.idxEngine.ReindexPart(ctx, entry.Part, block); err != nil {
@@ -324,4 +351,103 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
 	}
 
 	return nil
+}
+
+const (
+	pendingBackoffBase = 5 * time.Second
+	pendingBackoffMax  = 5 * time.Minute
+)
+
+type pendingAttempt struct {
+	count  int
+	nextAt time.Time
+}
+
+func (pa pendingAttempt) delay() time.Duration {
+	if pa.count == 0 {
+		return 0
+	}
+	// 5s, 10s, 20s, 40s, 80s, 160s, 320s → capped at 300s
+	d := pendingBackoffBase << min(pa.count-1, 6)
+	return min(d, pendingBackoffMax)
+}
+
+// bumpPendingBackoff increments the retry counter for id and schedules the next attempt.
+func (l *LSM) bumpPendingBackoff(id string, now time.Time) {
+	l.mu.Lock()
+	pa := l.pendingAttempts[id]
+	pa.count++
+	pa.nextAt = now.Add(pa.delay())
+	l.pendingAttempts[id] = pa
+	l.mu.Unlock()
+}
+
+// retryPendingParts attempts to fetch parts that were unreachable at bootstrap,
+// using exponential backoff per part (5s → 5m cap).
+// peers is the current live-peer address list, resolved once per tick by the caller.
+func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	now := time.Now()
+
+	l.mu.RLock()
+	if len(l.pendingParts) == 0 {
+		l.mu.RUnlock()
+		return
+	}
+	type work struct {
+		id   string
+		meta shrimptypes.PartMeta
+	}
+	var due []work
+	for id, meta := range l.pendingParts {
+		if pa := l.pendingAttempts[id]; now.Before(pa.nextAt) {
+			continue
+		}
+		due = append(due, work{id, meta})
+	}
+	l.mu.RUnlock()
+
+	for _, w := range due {
+		if ctx.Err() != nil {
+			return
+		}
+
+		raw, block, err := fetchRemotePart(ctx, w.meta, peers, remoteHTTP)
+		if err != nil {
+			l.bumpPendingBackoff(w.id, now)
+			l.mu.RLock()
+			next := l.pendingAttempts[w.id].nextAt
+			l.mu.RUnlock()
+			slog.DebugContext(ctx, "pending part still unreachable", "id", w.id, "next_retry", next.Round(time.Second), "error", err)
+			continue
+		}
+
+		if err := writeRawPart(l.partPath(w.id), raw); err != nil {
+			slog.WarnContext(ctx, "pending part: write failed", "id", w.id, "error", err)
+			l.bumpPendingBackoff(w.id, now)
+			continue
+		}
+		w.meta.Compression = shrimpblock.DetectAlgo(raw)
+		if err := WriteMeta(l.partMetaPath(w.id), w.meta); err != nil {
+			_ = os.Remove(l.partPath(w.id))
+			slog.WarnContext(ctx, "pending part: write meta failed", "id", w.id, "error", err)
+			l.bumpPendingBackoff(w.id, now)
+			continue
+		}
+
+		l.mu.Lock()
+		l.parts = append(l.parts, w.meta)
+		delete(l.pendingParts, w.id)
+		delete(l.pendingAttempts, w.id)
+		l.mu.Unlock()
+
+		slog.InfoContext(ctx, "fetched previously pending part", "id", w.id)
+
+		if err := l.idxEngine.ReindexPart(ctx, w.meta, block); err != nil {
+			slog.WarnContext(ctx, "pending part: reindex failed", "id", w.id, "error", err)
+		}
+	}
 }

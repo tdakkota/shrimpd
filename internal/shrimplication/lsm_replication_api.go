@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,24 +77,46 @@ func (l *LSM) ServeLocalPart(r *http.Request, w http.ResponseWriter) error {
 	return copyErr
 }
 
-// fetchRemotePart downloads a part from its source node.
-// It returns the raw bytes (to be written to disk verbatim) and the decoded
-// Block (for indexing). Writing raw bytes preserves the on-disk format
-// (V2 binary or compressed JSON) so that PartManager can open it correctly.
-func fetchRemotePart(meta shrimptypes.PartMeta, remoteHTTP *http.Client) (raw []byte, block shrimptypes.Block, err error) {
-	u := (&url.URL{Scheme: "http", Host: meta.Addr}).JoinPath("part", meta.ID)
+// fetchRemotePart downloads a part, trying meta.Addr first then each addr in
+// extraCandidates until one succeeds. This allows recovery when the origin node
+// has merged/GC'd the part — any live peer that already replicated it will serve it.
+//
+// It returns the raw bytes (to be written verbatim) and the decoded Block (for indexing).
+func fetchRemotePart(ctx context.Context, meta shrimptypes.PartMeta, extraCandidates []string, client *http.Client) (raw []byte, block shrimptypes.Block, err error) {
+	candidates := make([]string, 0, 1+len(extraCandidates))
+	candidates = append(candidates, meta.Addr)
+	for _, c := range extraCandidates {
+		if c != meta.Addr {
+			candidates = append(candidates, c)
+		}
+	}
 
-	req, err := http.NewRequest(http.MethodGet, u.String(), http.NoBody)
+	var errs []error
+	for _, addr := range candidates {
+		raw, block, err = tryFetchPartFrom(ctx, addr, meta, client)
+		if err == nil {
+			return raw, block, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", addr, err))
+	}
+	return nil, shrimptypes.Block{}, errors.Join(errs...)
+}
+
+// tryFetchPartFrom fetches a single part from the given addr.
+func tryFetchPartFrom(ctx context.Context, addr string, meta shrimptypes.PartMeta, client *http.Client) (raw []byte, block shrimptypes.Block, err error) {
+	u := (&url.URL{Scheme: "http", Host: addr}).JoinPath("part", meta.ID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
 	if err != nil {
 		return nil, shrimptypes.Block{}, err
 	}
-	resp, err := remoteHTTP.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, shrimptypes.Block{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		return nil, shrimptypes.Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
+		return nil, shrimptypes.Block{}, fmt.Errorf("remote %s from %s: HTTP %d", meta.ID, addr, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)

@@ -443,6 +443,31 @@ func (r *Registry) GetActiveNodes(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// GetLivePeerAddrs returns HTTP addresses of all live nodes except excludeID.
+// It reads ephemeral node entries (not /pointer keys) and decodes their nodeInfo.
+func (r *Registry) GetLivePeerAddrs(ctx context.Context, excludeID string) ([]string, error) {
+	resp, err := r.cli.Get(ctx, nodePrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	var addrs []string
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if strings.HasSuffix(key, "/pointer") {
+			continue
+		}
+		var info nodeInfo
+		if err := json.Unmarshal(kv.Value, &info); err != nil {
+			continue
+		}
+		if info.ID == excludeID || info.Addr == "" {
+			continue
+		}
+		addrs = append(addrs, info.Addr)
+	}
+	return addrs, nil
+}
+
 // SetQueuePointer stores the last processed log index for this node.
 func (r *Registry) SetQueuePointer(ctx context.Context, index int64) error {
 	key := fmt.Sprintf("%s%s/pointer", nodePrefix, r.nodeID)

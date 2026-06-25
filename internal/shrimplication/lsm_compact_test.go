@@ -14,10 +14,11 @@ import (
 )
 
 type stubRegistry struct {
-	appendOp   LogOp
-	appendPart string
-	appendOld  []string
-	appendMeta shrimptypes.PartMeta
+	appendOp      LogOp
+	appendPart    string
+	appendOld     []string
+	appendMeta    shrimptypes.PartMeta
+	bootstrapSnap BootstrapSnapshot
 }
 
 func (s *stubRegistry) RegisterNode(context.Context, string) error         { return nil }
@@ -27,12 +28,13 @@ func (s *stubRegistry) GetActiveParts(context.Context) (map[string]shrimptypes.P
 }
 
 func (s *stubRegistry) GetBootstrapSnapshot(context.Context) (BootstrapSnapshot, error) {
-	return BootstrapSnapshot{}, nil
+	return s.bootstrapSnap, nil
 }
-func (s *stubRegistry) logEntryExists(context.Context, int64) (bool, error) { return false, nil }
-func (s *stubRegistry) LogCleanupLoop(context.Context)                      {}
-func (s *stubRegistry) GetQueuePointer(context.Context) (int64, error)      { return 0, nil }
-func (s *stubRegistry) SetQueuePointer(context.Context, int64) error        { return nil }
+func (s *stubRegistry) logEntryExists(context.Context, int64) (bool, error)        { return false, nil }
+func (s *stubRegistry) LogCleanupLoop(context.Context)                             {}
+func (s *stubRegistry) GetQueuePointer(context.Context) (int64, error)             { return 0, nil }
+func (s *stubRegistry) SetQueuePointer(context.Context, int64) error               { return nil }
+func (s *stubRegistry) GetLivePeerAddrs(context.Context, string) ([]string, error) { return nil, nil }
 func (s *stubRegistry) AppendLog(_ context.Context, op LogOp, part shrimptypes.PartMeta, oldParts []string) (int64, error) {
 	s.appendOp = op
 	s.appendPart = part.ID
