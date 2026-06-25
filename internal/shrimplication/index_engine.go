@@ -475,11 +475,16 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 	{
 		merged, err := vellum.Open(tmpName)
 		if err == nil {
-			if k, err2 := merged.GetMinKey(); err2 == nil && len(k) > 0 {
-				minToken = string(k)
-			}
-			if k, err2 := merged.GetMaxKey(); err2 == nil && len(k) > 0 {
-				maxToken = string(k)
+			// GetMinKey/GetMaxKey panic (index out of range [-1]) on an empty
+			// FST, which the filtering merge can legitimately produce when every
+			// entry points at an inactive data part. Guard with the key count.
+			if merged.Len() > 0 {
+				if k, err2 := merged.GetMinKey(); err2 == nil && len(k) > 0 {
+					minToken = string(k)
+				}
+				if k, err2 := merged.GetMaxKey(); err2 == nil && len(k) > 0 {
+					maxToken = string(k)
+				}
 			}
 			_ = merged.Close()
 		}
@@ -662,9 +667,18 @@ func (e *IndexEngine) LookupTokens(ctx context.Context, tokens []string, candida
 	return finalMatches, true, nil
 }
 
-// ReindexPart derives and writes index entries for an existing data part.
+// ReindexPart derives and writes index entries for an existing data part (legacy Block path).
 func (e *IndexEngine) ReindexPart(_ context.Context, meta shrimptypes.PartMeta, block shrimptypes.Block) error {
 	entries := shrimpblock.BuildIndexEntries(meta.ID, block.Data)
+	if err := e.Write(entries); err != nil {
+		return err
+	}
+	return e.MarkCovered([]string{meta.ID})
+}
+
+// ReindexPartFile walks a part file and reindexes without full Block materialization.
+func (e *IndexEngine) ReindexPartFile(_ context.Context, meta shrimptypes.PartMeta, pf *shrimpblock.PartFileV2) error {
+	entries := shrimpblock.BuildIndexEntriesFromPart(meta.ID, pf)
 	if err := e.Write(entries); err != nil {
 		return err
 	}
