@@ -187,18 +187,18 @@ func TestWritePartV2FromIter(t *testing.T) {
 
 	gotA := make([]shrimptypes.Entry, 0, len(entries))
 	for i := range pfA.Headers {
-		rb, err := ReadRowBlock(pfA, i)
+		bb, err := ReadBinBlock(pfA, i)
 		require.NoError(t, err)
-		for j := range rb.Timestamps {
-			gotA = append(gotA, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+		for j := range bb.TS {
+			gotA = append(gotA, shrimptypes.Entry{Timestamp: bb.TS[j], Data: string(bb.DataBytes(j))})
 		}
 	}
 	gotB := make([]shrimptypes.Entry, 0, len(entries))
 	for i := range pfB.Headers {
-		rb, err := ReadRowBlock(pfB, i)
+		bb, err := ReadBinBlock(pfB, i)
 		require.NoError(t, err)
-		for j := range rb.Timestamps {
-			gotB = append(gotB, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+		for j := range bb.TS {
+			gotB = append(gotB, shrimptypes.Entry{Timestamp: bb.TS[j], Data: string(bb.DataBytes(j))})
 		}
 	}
 	require.True(t, slices.Equal(gotA, gotB))

@@ -13,7 +13,7 @@ type blockCursor struct {
 	part  int
 	block int
 	idx   int
-	rb    *shrimptypes.RowBlock
+	bb    *BinBlock
 	ts    int64
 }
 
@@ -49,20 +49,20 @@ func (h *mergeHeap) Pop() any {
 }
 
 func nextCursor(pf *PartFileV2, part, block int) (*blockCursor, error) {
-	rb, err := ReadRowBlock(pf, block)
+	bb, err := ReadBinBlock(pf, block)
 	if err != nil {
 		return nil, err
 	}
-	if len(rb.Timestamps) == 0 {
+	if len(bb.TS) == 0 {
 		return nil, nil
 	}
-	return &blockCursor{pf: pf, part: part, block: block, idx: 0, rb: rb, ts: rb.Timestamps[0]}, nil
+	return &blockCursor{pf: pf, part: part, block: block, idx: 0, bb: bb, ts: bb.TS[0]}, nil
 }
 
 func advanceCursor(c *blockCursor) (*blockCursor, error) {
 	c.idx++
-	if c.idx < len(c.rb.Timestamps) {
-		c.ts = c.rb.Timestamps[c.idx]
+	if c.idx < len(c.bb.TS) {
+		c.ts = c.bb.TS[c.idx]
 		return c, nil
 	}
 	c.block++
@@ -90,12 +90,12 @@ func MergeParts(parts []*PartFileV2) iter.Seq2[shrimptypes.Entry, error] {
 			}
 		}
 		heap.Init(&h)
-		for h.Len() > 0 {
-			c := h[0]
-			entry := shrimptypes.Entry{Timestamp: c.ts, Data: c.rb.Data[c.idx]}
-			if !yield(entry, nil) {
-				return
-			}
+	for h.Len() > 0 {
+		c := h[0]
+		entry := shrimptypes.Entry{Timestamp: c.ts, Data: string(c.bb.DataBytes(c.idx))}
+		if !yield(entry, nil) {
+			return
+		}
 			next, err := advanceCursor(c)
 			if err != nil {
 				yield(shrimptypes.Entry{}, fmt.Errorf("advance part %d block %d: %w", c.part, c.block, err))

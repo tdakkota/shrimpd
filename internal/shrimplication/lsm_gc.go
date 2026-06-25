@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -104,7 +105,7 @@ func (l *LSM) runGC(ctx context.Context) error {
 
 // evictPart cleans up cached resources for the given part ID.
 func (l *LSM) evictPart(id string) {
-	l.rowBlockCache.DeleteByFunc(func(k shrimptypes.RowCacheKey, _ *shrimptypes.RowBlock) bool {
+	l.rowBlockCache.DeleteByFunc(func(k shrimptypes.RowCacheKey, _ *shrimpblock.BinBlock) bool {
 		return k.PartID == id
 	})
 	l.partMgr.Release(id)

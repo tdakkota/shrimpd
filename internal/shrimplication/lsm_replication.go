@@ -36,7 +36,7 @@ func (l *LSM) startup(ctx context.Context) error {
 			}
 			continue
 		}
-		raw, _, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
+		raw, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
 		if err != nil {
 			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
 			l.mu.Lock()
@@ -68,12 +68,12 @@ func (l *LSM) startup(ctx context.Context) error {
 	// Repair missing local sidecars (L1 sparse index).
 	for _, p := range l.parts {
 		if _, err := shrimpblock.ReadSidecar(l.sidecarPath(p.ID)); os.IsNotExist(err) {
-			if b, err := l.readPartBlock(p); err == nil {
-				if err := shrimpblock.WriteSidecar(l.sidecarPath(p.ID), shrimpblock.BuildSparse(b.Data, 32)); err != nil {
+			if pf, err := l.partMgr.Get(p.ID, p); err == nil && pf != nil {
+				if err := shrimpblock.WriteSidecar(l.sidecarPath(p.ID), shrimpblock.BuildSparseFromPart(pf, 32)); err != nil {
 					slog.WarnContext(ctx, "repair sidecar failed", "id", p.ID, "error", err)
 				}
-			} else {
-				slog.WarnContext(ctx, "repair sidecar: read part failed", "id", p.ID, "error", err)
+			} else if err != nil {
+				slog.WarnContext(ctx, "repair sidecar: open part failed", "id", p.ID, "error", err)
 			}
 		}
 	}
@@ -84,12 +84,12 @@ func (l *LSM) startup(ctx context.Context) error {
 		_, covered := l.idxEngine.covered[p.ID]
 		l.idxEngine.mu.RUnlock()
 		if !covered {
-			block, err := l.readPartBlock(p)
-			if err != nil {
-				slog.WarnContext(ctx, "startup index reconciliation: read part failed", "id", p.ID, "error", err)
+			pf, err := l.partMgr.Get(p.ID, p)
+			if err != nil || pf == nil {
+				slog.WarnContext(ctx, "startup index reconciliation: open part failed", "id", p.ID, "error", err)
 				continue
 			}
-			if err := l.idxEngine.ReindexPart(ctx, p, block); err != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, p, pf); err != nil {
 				slog.WarnContext(ctx, "startup index reconciliation: reindex failed", "id", p.ID, "error", err)
 			}
 		}
@@ -201,7 +201,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 			}
 			continue
 		}
-		raw, _, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
+		raw, err := fetchRemotePart(ctx, meta, nil, remoteHTTP)
 		if err != nil {
 			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
 			l.mu.Lock()
@@ -236,12 +236,12 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 		_, covered := l.idxEngine.covered[p.ID]
 		l.idxEngine.mu.RUnlock()
 		if !covered {
-			block, err := l.readPartBlock(p)
-			if err != nil {
-				slog.WarnContext(ctx, "bootstrap index reconciliation: read part failed", "id", p.ID, "error", err)
+			pf, err := l.partMgr.Get(p.ID, p)
+			if err != nil || pf == nil {
+				slog.WarnContext(ctx, "bootstrap index reconciliation: open part failed", "id", p.ID, "error", err)
 				continue
 			}
-			if err := l.idxEngine.ReindexPart(ctx, p, block); err != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, p, pf); err != nil {
 				slog.WarnContext(ctx, "bootstrap index reconciliation: reindex failed", "id", p.ID, "error", err)
 			}
 		}
@@ -263,7 +263,7 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string)
 	switch entry.Op {
 	case OpPut:
 		slog.InfoContext(ctx, "replicating PUT part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		raw, block, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
+		raw, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -293,13 +293,15 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string)
 		}
 		l.mu.Unlock()
 
-		if err := l.idxEngine.ReindexPart(ctx, entry.Part, block); err != nil {
-			slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+		if pf, err := l.partMgr.Get(entry.Part.ID, entry.Part); err == nil && pf != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, entry.Part, pf); err != nil {
+				slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+			}
 		}
 
 	case OpMerge:
 		slog.InfoContext(ctx, "replicating MERGE part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
-		raw, block, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
+		raw, err := fetchRemotePart(ctx, entry.Part, peers, remoteHTTP)
 		if err != nil {
 			return fmt.Errorf("fetch remote part: %w", err)
 		}
@@ -345,8 +347,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string)
 		}
 		l.mu.Unlock()
 
-		if err := l.idxEngine.ReindexPart(ctx, entry.Part, block); err != nil {
-			slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+		if pf, err := l.partMgr.Get(entry.Part.ID, entry.Part); err == nil && pf != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, entry.Part, pf); err != nil {
+				slog.WarnContext(ctx, "failed to reindex replicated part", "id", entry.Part.ID, "error", err)
+			}
 		}
 	}
 
@@ -415,7 +419,7 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 			return
 		}
 
-		raw, block, err := fetchRemotePart(ctx, w.meta, peers, remoteHTTP)
+		raw, err := fetchRemotePart(ctx, w.meta, peers, remoteHTTP)
 		if err != nil {
 			l.bumpPendingBackoff(w.id, now)
 			l.mu.RLock()
@@ -446,8 +450,10 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 
 		slog.InfoContext(ctx, "fetched previously pending part", "id", w.id)
 
-		if err := l.idxEngine.ReindexPart(ctx, w.meta, block); err != nil {
-			slog.WarnContext(ctx, "pending part: reindex failed", "id", w.id, "error", err)
+		if pf, err := l.partMgr.Get(w.id, w.meta); err == nil && pf != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, w.meta, pf); err != nil {
+				slog.WarnContext(ctx, "pending part: reindex failed", "id", w.id, "error", err)
+			}
 		}
 	}
 }

@@ -154,10 +154,9 @@ func TestFetchRemotePartFallback(t *testing.T) {
 	}
 	candidates := []string{peer.Listener.Addr().String()}
 
-	raw, block, err := fetchRemotePart(context.Background(), meta, candidates, &http.Client{})
+	raw, err := fetchRemotePart(context.Background(), meta, candidates, &http.Client{})
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
-	require.Len(t, block.Data, 2, "expected 2 entries decoded from the peer")
 }
 
 // stubRegistry satisfies registryAPI; its fields and methods are defined in lsm_compact_test.go.

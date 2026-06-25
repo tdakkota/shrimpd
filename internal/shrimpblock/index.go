@@ -52,6 +52,45 @@ func BuildIndexEntries(dataID string, entries []shrimptypes.Entry) []shrimptypes
 	return out
 }
 
+// BuildIndexEntriesFromPart walks a V2 part file and returns index entries without
+// materializing a full []Entry slice. One transient string per row for Tokenize/ExtractLabels.
+func BuildIndexEntriesFromPart(dataID string, pf *PartFileV2) []shrimptypes.IndexEntry {
+	seen := make(map[string]struct{})
+	var out []shrimptypes.IndexEntry
+
+	add := func(token string) {
+		if _, ok := seen[token]; !ok {
+			seen[token] = struct{}{}
+			out = append(out, shrimptypes.IndexEntry{Token: token, DataID: dataID})
+		}
+	}
+
+	for bi := range pf.Headers {
+		bb, err := ReadBinBlock(pf, bi)
+		if err != nil {
+			continue
+		}
+		for i := range bb.TS {
+			s := string(bb.DataBytes(i))
+			for tok := range Tokenize(s) {
+				add(tok)
+			}
+			labels := shrimpfilter.ExtractLabels(s)
+			for k, v := range labels {
+				add(LabelTokenPrefix + k + "=" + v)
+			}
+		}
+	}
+
+	slices.SortFunc(out, func(a, b shrimptypes.IndexEntry) int {
+		if c := cmp.Compare(a.Token, b.Token); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.DataID, b.DataID)
+	})
+	return out
+}
+
 // compositeKey builds the FST composite key: token + "\x00" + dataID.
 func compositeKey(token, dataID string) []byte {
 	key := make([]byte, len(token)+1+len(dataID))

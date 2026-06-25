@@ -1,9 +1,12 @@
 package shrimpblock
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"slices"
 
+	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -93,4 +96,128 @@ func (bb BinBlock) DataBytes(i int) []byte {
 // Data returns the i-th entry's data as a string (allocates on match).
 func (bb BinBlock) Data(i int) string {
 	return string(bb.DataBytes(i))
+}
+
+// HeapCost returns the approximate heap size of this decoded block for cache sizing.
+func (bb BinBlock) HeapCost() uint32 {
+	return uint32(len(bb.Blob) + len(bb.TS)*8 + len(bb.Offsets)*4)
+}
+
+// rowOf returns the row index whose [Offsets[k], Offsets[k+1]) contains byte offset pos.
+// Uses binary search over Offsets.
+func (bb BinBlock) rowOf(pos int) int {
+	// Offsets has len = count+1; search for the largest i where Offsets[i] <= pos < Offsets[i+1]
+	k, _ := slices.BinarySearch(bb.Offsets, uint32(pos))
+	if k > 0 && int(bb.Offsets[k]) > pos {
+		k--
+	}
+	if k < 0 {
+		k = 0
+	}
+	if k >= len(bb.TS) {
+		k = len(bb.TS) - 1
+	}
+	return k
+}
+
+// Iterate calls fn for each row whose timestamp is in [from,to] and whose data
+// contains the (pre-lowercased) term. fn receives a []byte subslice; caller
+// allocates string only on a hit.
+func (bb BinBlock) Iterate(from, to int64, term string, fn func(ts int64, data []byte) error) error {
+	for i := range bb.TS {
+		ts := bb.TS[i]
+		if ts < from || ts > to {
+			continue
+		}
+		b := bb.DataBytes(i)
+		if term != "" && !shrimptypes.FoldContains(b, term) {
+			continue
+		}
+		if err := fn(ts, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IterateMatcher calls fn for each row that passes timestamp range and m.
+// Uses SIMD bytes.Index over the whole Blob for OpLineEq literals when present.
+func (bb BinBlock) IterateMatcher(from, to int64, m shrimpfilter.Matcher, fn func(ts int64, data []byte) error) error {
+	// Collect case-sensitive OpLineEq literals for SIMD scan.
+	var eqLits [][]byte
+	for _, lf := range m.Line {
+		if lf.Op == shrimpfilter.OpLineEq {
+			eqLits = append(eqLits, []byte(lf.Value))
+		}
+	}
+
+	if len(eqLits) > 0 {
+		// Pick longest literal as most selective.
+		lit := eqLits[0]
+		for _, e := range eqLits[1:] {
+			if len(e) > len(lit) {
+				lit = e
+			}
+		}
+		candidates := make([]int, 0, 16)
+		for pos := 0; pos < len(bb.Blob); {
+			i := bytes.Index(bb.Blob[pos:], lit)
+			if i < 0 {
+				break
+			}
+			at := pos + i
+			k := bb.rowOf(at)
+			end := int(bb.Offsets[k+1])
+			if at+len(lit) <= end {
+				candidates = append(candidates, k)
+				pos = end
+			} else {
+				pos = at + 1
+			}
+		}
+		for _, k := range candidates {
+			ts := bb.TS[k]
+			if ts < from || ts > to {
+				continue
+			}
+			b := bb.DataBytes(k)
+			if !m.MatchLineBytes(b) {
+				continue
+			}
+			if len(m.Labels) > 0 {
+				s := string(b)
+				labels := shrimpfilter.ExtractLabels(s)
+				if !m.MatchLabels(labels) {
+					continue
+				}
+			}
+			if err := fn(ts, b); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Fallback: per-row loop.
+	for i := range bb.TS {
+		ts := bb.TS[i]
+		if ts < from || ts > to {
+			continue
+		}
+		b := bb.DataBytes(i)
+		if !m.MatchLineBytes(b) {
+			continue
+		}
+		if len(m.Labels) > 0 {
+			s := string(b)
+			labels := shrimpfilter.ExtractLabels(s)
+			if !m.MatchLabels(labels) {
+				continue
+			}
+		}
+		if err := fn(ts, b); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -8,6 +8,28 @@ import (
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
+func TestBuildSparseFromPart(t *testing.T) {
+	entries := []shrimptypes.Entry{
+		{Timestamp: 1, Data: "a"},
+		{Timestamp: 2, Data: "b"},
+		{Timestamp: 3, Data: "c"},
+		{Timestamp: 4, Data: "d"},
+	}
+	path := t.TempDir() + "/p.json"
+	_, err := WritePartV2(path, entries)
+	require.NoError(t, err)
+	pf, err := OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pf.Close()
+
+	sp := BuildSparseFromPart(pf, 2)
+	require.Len(t, sp, 2)
+	require.Equal(t, int64(1), sp[0].Timestamp)
+	require.Equal(t, 0, sp[0].Idx)
+	require.Equal(t, int64(3), sp[1].Timestamp)
+	require.Equal(t, 2, sp[1].Idx)
+}
+
 func TestBuildSparse(t *testing.T) {
 	for _, tt := range []struct {
 		numEntries int

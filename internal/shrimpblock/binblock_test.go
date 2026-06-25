@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -130,4 +131,57 @@ func TestDecodeBinBlock_AllOffsetsZeroPanic(t *testing.T) {
 	bb, err := DecodeBinBlock(buf, 1)
 	require.NoError(t, err)
 	require.Empty(t, bb.DataBytes(0))
+}
+
+func TestBinBlock_rowOf(t *testing.T) {
+	entries := []shrimptypes.Entry{
+		{Timestamp: 1, Data: "abc"},
+		{Timestamp: 2, Data: "defgh"},
+		{Timestamp: 3, Data: "x"},
+	}
+	buf := EncodeBinBlock(entries, nil)
+	bb, err := DecodeBinBlock(buf, len(entries))
+	require.NoError(t, err)
+
+	// offsets: [0, 3, 8, 9]
+	require.Equal(t, 0, bb.rowOf(0))
+	require.Equal(t, 0, bb.rowOf(2))
+	require.Equal(t, 1, bb.rowOf(3))
+	require.Equal(t, 1, bb.rowOf(7))
+	require.Equal(t, 2, bb.rowOf(8))
+	require.Equal(t, 2, bb.rowOf(8))
+}
+
+func TestBinBlock_IterateMatcher_BoundaryRejection(t *testing.T) {
+	// Two rows whose data would produce a boundary-spanning match for "bcde".
+	// row0 ends with "bc", row1 starts with "de" => "bcde" crosses boundary.
+	entries := []shrimptypes.Entry{
+		{Timestamp: 10, Data: "xxbc"},
+		{Timestamp: 20, Data: "deyy"},
+	}
+	buf := EncodeBinBlock(entries, nil)
+	bb, err := DecodeBinBlock(buf, len(entries))
+	require.NoError(t, err)
+
+	m, _ := shrimpfilter.CompileMatcher([]shrimpfilter.LineFilter{{Op: shrimpfilter.OpLineEq, Value: "bcde"}}, nil)
+	var hits int
+	_ = bb.IterateMatcher(0, 100, m, func(ts int64, data []byte) error {
+		hits++
+		return nil
+	})
+	require.Equal(t, 0, hits, "boundary-spanning literal must not match")
+}
+
+func TestBinBlock_Iterate_CaseInsensitive(t *testing.T) {
+	entries := []shrimptypes.Entry{{Timestamp: 1, Data: "Error: foo"}}
+	buf := EncodeBinBlock(entries, nil)
+	bb, err := DecodeBinBlock(buf, len(entries))
+	require.NoError(t, err)
+
+	var hits int
+	_ = bb.Iterate(0, 10, "error", func(ts int64, data []byte) error {
+		hits++
+		return nil
+	})
+	require.Equal(t, 1, hits)
 }

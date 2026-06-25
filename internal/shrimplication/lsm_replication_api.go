@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/tdakkota/shrimpd/internal/shrimpblock"
@@ -81,8 +80,9 @@ func (l *LSM) ServeLocalPart(r *http.Request, w http.ResponseWriter) error {
 // extraCandidates until one succeeds. This allows recovery when the origin node
 // has merged/GC'd the part — any live peer that already replicated it will serve it.
 //
-// It returns the raw bytes (to be written verbatim) and the decoded Block (for indexing).
-func fetchRemotePart(ctx context.Context, meta shrimptypes.PartMeta, extraCandidates []string, client *http.Client) (raw []byte, block shrimptypes.Block, err error) {
+// It returns the raw bytes (to be written verbatim). Caller should open the part
+// via PartManager and call IndexEngine.ReindexPartFile for indexing.
+func fetchRemotePart(ctx context.Context, meta shrimptypes.PartMeta, extraCandidates []string, client *http.Client) (raw []byte, err error) {
 	candidates := make([]string, 0, 1+len(extraCandidates))
 	candidates = append(candidates, meta.Addr)
 	for _, c := range extraCandidates {
@@ -93,36 +93,36 @@ func fetchRemotePart(ctx context.Context, meta shrimptypes.PartMeta, extraCandid
 
 	var errs []error
 	for _, addr := range candidates {
-		raw, block, err = tryFetchPartFrom(ctx, addr, meta, client)
+		raw, err = tryFetchPartFrom(ctx, addr, meta, client)
 		if err == nil {
-			return raw, block, nil
+			return raw, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", addr, err))
 	}
-	return nil, shrimptypes.Block{}, errors.Join(errs...)
+	return nil, errors.Join(errs...)
 }
 
 // tryFetchPartFrom fetches a single part from the given addr.
-func tryFetchPartFrom(ctx context.Context, addr string, meta shrimptypes.PartMeta, client *http.Client) (raw []byte, block shrimptypes.Block, err error) {
+func tryFetchPartFrom(ctx context.Context, addr string, meta shrimptypes.PartMeta, client *http.Client) (raw []byte, err error) {
 	u := (&url.URL{Scheme: "http", Host: addr}).JoinPath("part", meta.ID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
 	if err != nil {
-		return nil, shrimptypes.Block{}, err
+		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, shrimptypes.Block{}, err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
-		return nil, shrimptypes.Block{}, fmt.Errorf("remote %s from %s: HTTP %d", meta.ID, addr, resp.StatusCode)
+		return nil, fmt.Errorf("remote %s from %s: HTTP %d", meta.ID, addr, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		_ = resp.Body.Close()
-		return nil, shrimptypes.Block{}, fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 	_ = resp.Body.Close()
 
@@ -143,42 +143,23 @@ func tryFetchPartFrom(ctx context.Context, addr string, meta shrimptypes.PartMet
 
 	// V2 binary format: write raw bytes verbatim so PartManager can open them.
 	if len(body) >= 4 && string(body[:4]) == shrimpblock.MagicShrimp {
-		tmpDir, _ := os.MkdirTemp("", "shrimpd-fetch-*")
-		tmpPath := filepath.Join(tmpDir, meta.ID+".json")
-		if err := os.WriteFile(tmpPath, body, 0o600); err != nil {
-			_ = os.RemoveAll(tmpDir)
-			return nil, shrimptypes.Block{}, fmt.Errorf("write tmp v2: %w", err)
-		}
-		pf, err := shrimpblock.OpenPartV2(tmpPath, meta)
-		if err != nil {
-			_ = os.RemoveAll(tmpDir)
-			return nil, shrimptypes.Block{}, fmt.Errorf("open v2: %w", err)
-		}
-		if pf == nil {
-			_ = os.RemoveAll(tmpDir)
-			return nil, shrimptypes.Block{}, fmt.Errorf("invalid v2 magic: %s", meta.ID)
-		}
-		b, err := shrimpblock.V2ToBlock(pf)
-		_ = pf.Close()
-		_ = os.RemoveAll(tmpDir)
-		if err != nil {
-			return nil, shrimptypes.Block{}, fmt.Errorf("v2 to block: %w", err)
-		}
-		return body, b, nil
+		return body, nil
 	}
 
 	r, _, err := shrimpblock.OpenBlockReader(bytes.NewReader(body))
 	if err != nil {
-		return nil, shrimptypes.Block{}, err
+		return nil, err
 	}
 	var b shrimptypes.Block
 	decodeErr := json.NewDecoder(r).Decode(&b)
 	rCloseErr := r.Close()
 	if decodeErr != nil {
-		return nil, shrimptypes.Block{}, decodeErr
+		return nil, decodeErr
 	}
 	if rCloseErr != nil {
-		return nil, shrimptypes.Block{}, rCloseErr
+		return nil, rCloseErr
 	}
-	return body, b, nil
+	// Legacy JSON: re-encode to bytes for writeRawPart (kept for compatibility).
+	buf, _ := json.Marshal(b)
+	return buf, nil
 }

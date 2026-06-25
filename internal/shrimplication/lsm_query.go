@@ -96,25 +96,23 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-			rb, ok := l.rowBlockCache.Get(ck)
+			bb, ok := l.rowBlockCache.Get(ck)
 			if !ok {
 				var err error
-				rb, err = shrimpblock.ReadRowBlock(pf, i)
+				bb, err = shrimpblock.ReadBinBlock(pf, i)
 				if err != nil {
-					slog.WarnContext(ctx, "read row block", "id", meta.ID, "block", i, "error", err)
+					slog.WarnContext(ctx, "read bin block", "id", meta.ID, "block", i, "error", err)
 					continue
 				}
-				l.rowBlockCache.Set(ck, rb)
+				l.rowBlockCache.Set(ck, bb)
 			}
 
-			for j := range rb.Timestamps {
+			_ = bb.Iterate(from, to, normalizedTerm, func(ts int64, data []byte) error {
 				stats.EntriesScanned++
-				e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
-				if e.Matches(from, to, normalizedTerm) {
-					result = append(result, e)
-					stats.EntriesMatched++
-				}
-			}
+				result = append(result, shrimptypes.Entry{Timestamp: ts, Data: string(data)})
+				stats.EntriesMatched++
+				return nil
+			})
 		}
 	}
 
@@ -216,21 +214,22 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-			if rb, ok := l.rowBlockCache.Get(ck); ok {
-				for j := range rb.Timestamps {
+			if bb, ok := l.rowBlockCache.Get(ck); ok {
+				_ = bb.Iterate(from, to, normalizedTerm, func(ts int64, data []byte) error {
 					stats.EntriesScanned++
-					e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
+					e := shrimptypes.Entry{Timestamp: ts, Data: string(data)}
 					if e.Matches(from, to, normalizedTerm) {
 						stats.EntriesMatched++
 						if err := fn(e); err != nil {
-							return stats, err
+							return err
 						}
 					}
-				}
+					return nil
+				})
 				continue
 			}
 
-			// Cache miss: stream without building a RowBlock or populating cache.
+			// Cache miss: stream without populating cache.
 			stats.EntriesScanned += int(hdr.Count)
 			err := shrimpblock.StreamRowBlock(pf, i, from, to, normalizedTerm, func(e shrimptypes.Entry) error {
 				stats.EntriesMatched++
@@ -367,27 +366,22 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
-			if rb, ok := l.rowBlockCache.Get(ck); ok {
-				for j := range rb.Timestamps {
+			if bb, ok := l.rowBlockCache.Get(ck); ok {
+				_ = bb.IterateMatcher(from, to, m, func(ts int64, data []byte) error {
 					stats.EntriesScanned++
-					e := shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]}
-					if e.Timestamp < from || e.Timestamp > to {
-						continue
-					}
-					if !m.MatchLine(e.Data) {
-						continue
-					}
+					e := shrimptypes.Entry{Timestamp: ts, Data: string(data)}
 					if len(m.Labels) > 0 {
 						labels := shrimpfilter.ExtractLabels(e.Data)
 						if !m.MatchLabels(labels) {
-							continue
+							return nil
 						}
 					}
 					stats.EntriesMatched++
 					if err := fn(e); err != nil {
-						return stats, err
+						return err
 					}
-				}
+					return nil
+				})
 				continue
 			}
 

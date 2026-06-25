@@ -127,14 +127,9 @@ const (
 // It is used to quickly check whether a token might be present in a block of data.
 type BloomFilter [BloomBytes]byte
 
-// RowBlock is the decoded content of one block.
-type RowBlock struct {
-	Timestamps []int64 // sorted, parallel to Data
-	Data       []string
-	Cost       uint32 // precomputed byte-cost for cache sizing
-}
 
-// RowCacheKey is the cache key for RowBlock caching.
+
+// RowCacheKey is the cache key for BinBlock caching.
 type RowCacheKey struct {
 	PartID string
 	Block  int

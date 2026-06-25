@@ -43,6 +43,27 @@ func TestGracefulDegradation(t *testing.T) {
 	require.Equal(t, 1<<31-1, hi)
 }
 
+func TestBuildIndexEntriesFromPart(t *testing.T) {
+	ents := []shrimptypes.Entry{
+		{Timestamp: 1, Data: "hello world hello"},
+		{Timestamp: 2, Data: "world test"},
+	}
+	path := t.TempDir() + "/p.json"
+	_, err := WritePartV2(path, ents)
+	require.NoError(t, err)
+	pf, err := OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pf.Close()
+
+	got := BuildIndexEntriesFromPart("part-1", pf)
+	want := []shrimptypes.IndexEntry{
+		{Token: "hello", DataID: "part-1"},
+		{Token: "test", DataID: "part-1"},
+		{Token: "world", DataID: "part-1"},
+	}
+	require.Equal(t, want, got)
+}
+
 func TestBuildIndexEntries(t *testing.T) {
 	ents := []shrimptypes.Entry{
 		{Timestamp: 1, Data: "hello world hello"},

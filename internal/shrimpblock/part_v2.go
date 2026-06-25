@@ -8,8 +8,6 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
-	"slices"
-	"time"
 
 	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
@@ -272,9 +270,9 @@ func (pf *PartFileV2) Close() error {
 	return pf.fd.Close()
 }
 
-// ReadRowBlock pread-fetches exactly hdr.CompressedSz bytes at hdr.Offset,
-// decompresses, decodes binary block into RowBlock.
-func ReadRowBlock(pf *PartFileV2, idx int) (*shrimptypes.RowBlock, error) {
+// ReadBinBlock pread-fetches exactly hdr.CompressedSz bytes at hdr.Offset,
+// decompresses, and returns a BinBlock view over the decoded buffer.
+func ReadBinBlock(pf *PartFileV2, idx int) (*BinBlock, error) {
 	if idx < 0 || idx >= len(pf.Headers) {
 		return nil, fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
 	}
@@ -300,23 +298,13 @@ func ReadRowBlock(pf *PartFileV2, idx int) (*shrimptypes.RowBlock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode block %d: %w", idx, err)
 	}
-
-	data := make([]string, hdr.Count)
-	for i := range bb.TS {
-		data[i] = bb.Data(i)
-	}
-
-	return &shrimptypes.RowBlock{
-		Timestamps: bb.TS,
-		Data:       data,
-		Cost:       uint32(len(decoded)),
-	}, nil
+	return &bb, nil
 }
 
 // VerifyPartV2 fully decodes every block in the part.
 func VerifyPartV2(pf *PartFileV2) error {
 	for i := range pf.Headers {
-		if _, err := ReadRowBlock(pf, i); err != nil {
+		if _, err := ReadBinBlock(pf, i); err != nil {
 			return fmt.Errorf("verify block %d: %w", i, err)
 		}
 	}
@@ -324,120 +312,27 @@ func VerifyPartV2(pf *PartFileV2) error {
 }
 
 // StreamRowBlock decompresses block idx and calls fn for each entry that passes
-// the timestamp range and term filter. No RowBlock is built and no result slice
-// is accumulated: only one string is allocated per matching entry.
-//
-// The decoded buffer is interpreted as a BinBlock, providing zero-alloc DataBytes
-// access for filter matching. Strings are only materialized for survivors.
+// the timestamp range and term filter. Delegates to ReadBinBlock + BinBlock.Iterate.
 func StreamRowBlock(pf *PartFileV2, idx int, from, to int64, term string, fn func(shrimptypes.Entry) error) error {
-	if idx < 0 || idx >= len(pf.Headers) {
-		return fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
-	}
-	hdr := pf.Headers[idx]
-
-	compressed := make([]byte, hdr.CompressedSz)
-	if _, err := pf.fd.ReadAt(compressed, hdr.Offset); err != nil {
-		return fmt.Errorf("read block %d: %w", idx, err)
-	}
-
-	dec := decoderPool.Get().(*zstd.Decoder)
-	decoded, err := dec.DecodeAll(compressed, nil)
-	_ = dec.Reset(nil)
-	decoderPool.Put(dec)
+	bb, err := ReadBinBlock(pf, idx)
 	if err != nil {
-		return fmt.Errorf("decompress block %d: %w", idx, err)
+		return err
 	}
-
-	bb, err := DecodeBinBlock(decoded, int(hdr.Count))
-	if err != nil {
-		return fmt.Errorf("decode block %d: %w", idx, err)
-	}
-
-	for i := range bb.TS {
-		ts := bb.TS[i]
-		if ts < from || ts > to {
-			continue
-		}
-		sb := bb.DataBytes(i)
-		if term != "" && !shrimptypes.FoldContains(sb, term) {
-			continue
-		}
-		if err := fn(shrimptypes.Entry{Timestamp: ts, Data: string(sb)}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return bb.Iterate(from, to, term, func(ts int64, data []byte) error {
+		return fn(shrimptypes.Entry{Timestamp: ts, Data: string(data)})
+	})
 }
 
 // StreamRowBlockMatcher is like StreamRowBlock but applies a shrimpfilter.Matcher
-// as a post-filter. Line filters run on DataBytes subslice; only survivors allocate
-// via string(sb) and then run label extraction + MatchLabels.
+// as a post-filter. Delegates to ReadBinBlock + BinBlock.IterateMatcher.
 func StreamRowBlockMatcher(pf *PartFileV2, idx int, from, to int64, m shrimpfilter.Matcher, fn func(shrimptypes.Entry) error) error {
-	if idx < 0 || idx >= len(pf.Headers) {
-		return fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
-	}
-	hdr := pf.Headers[idx]
-
-	compressed := make([]byte, hdr.CompressedSz)
-	if _, err := pf.fd.ReadAt(compressed, hdr.Offset); err != nil {
-		return fmt.Errorf("read block %d: %w", idx, err)
-	}
-
-	dec := decoderPool.Get().(*zstd.Decoder)
-	decoded, err := dec.DecodeAll(compressed, nil)
-	_ = dec.Reset(nil)
-	decoderPool.Put(dec)
+	bb, err := ReadBinBlock(pf, idx)
 	if err != nil {
-		return fmt.Errorf("decompress block %d: %w", idx, err)
+		return err
 	}
-
-	bb, err := DecodeBinBlock(decoded, int(hdr.Count))
-	if err != nil {
-		return fmt.Errorf("decode block %d: %w", idx, err)
-	}
-
-	for i := range bb.TS {
-		ts := bb.TS[i]
-		if ts < from || ts > to {
-			continue
-		}
-		sb := bb.DataBytes(i)
-		if !m.MatchLineBytes(sb) {
-			continue
-		}
-		s := string(sb)
-		if !m.Empty() && len(m.Labels) > 0 {
-			labels := shrimpfilter.ExtractLabels(s)
-			if !m.MatchLabels(labels) {
-				continue
-			}
-		}
-		if err := fn(shrimptypes.Entry{Timestamp: ts, Data: s}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// V2ToBlock converts a V2 part file to a legacy Block for backward-compatible
-// remote serving. It reads and merges all blocks.
-func V2ToBlock(pf *PartFileV2) (shrimptypes.Block, error) {
-	var entries []shrimptypes.Entry
-	for i := range pf.Headers {
-		rb, err := ReadRowBlock(pf, i)
-		if err != nil {
-			return shrimptypes.Block{}, err
-		}
-		for j := range rb.Timestamps {
-			entries = append(entries, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
-		}
-	}
-	slices.SortFunc(entries, func(a, b shrimptypes.Entry) int {
-		return int(a.Timestamp - b.Timestamp)
+	return bb.IterateMatcher(from, to, m, func(ts int64, data []byte) error {
+		return fn(shrimptypes.Entry{Timestamp: ts, Data: string(data)})
 	})
-	return shrimptypes.Block{
-		SourceReplica: pf.Meta.NodeID,
-		CreatedAt:     time.Now().UnixNano(),
-		Data:          entries,
-	}, nil
 }
+
+

@@ -2,12 +2,10 @@ package shrimplication
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/tdakkota/shrimpd/internal/fsyncutil"
-	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -21,18 +19,6 @@ func (l *LSM) partMetaPath(id string) string {
 
 func (l *LSM) sidecarPath(id string) string {
 	return filepath.Join(l.dataDir, "parts", id+".sparse.json")
-}
-
-// readPartBlock reads a local V2 part and returns a Block.
-func (l *LSM) readPartBlock(meta shrimptypes.PartMeta) (shrimptypes.Block, error) {
-	pf, err := l.partMgr.Get(meta.ID, meta)
-	if err != nil {
-		return shrimptypes.Block{}, err
-	}
-	if pf == nil {
-		return shrimptypes.Block{}, fmt.Errorf("v2 part not found: %s", meta.ID)
-	}
-	return shrimpblock.V2ToBlock(pf)
 }
 
 // ReadMeta reads [shrimptypes.PartMeta] from a .meta file on disk.

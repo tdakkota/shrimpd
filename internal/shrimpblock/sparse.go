@@ -20,6 +20,29 @@ func BuildSparse(entries []shrimptypes.Entry, every int) []shrimptypes.SparseEnt
 	return out
 }
 
+// BuildSparseFromPart walks a V2 part and builds a sparse index by sampling every Nth row
+// across the entire part (global row index). Only reads TS arrays; never touches Blob.
+func BuildSparseFromPart(pf *PartFileV2, every int) []shrimptypes.SparseEntry {
+	if every <= 0 {
+		every = 32
+	}
+	var out []shrimptypes.SparseEntry
+	global := 0
+	for bi := range pf.Headers {
+		bb, err := ReadBinBlock(pf, bi)
+		if err != nil {
+			continue
+		}
+		for i := range bb.TS {
+			if global%every == 0 {
+				out = append(out, shrimptypes.SparseEntry{Timestamp: bb.TS[i], Idx: global})
+			}
+			global++
+		}
+	}
+	return out
+}
+
 // SparseRange returns the range of indices in a sparse index that overlap with the given timestamp range.
 func SparseRange(sparse []shrimptypes.SparseEntry, from, to int64) (lo, hi int) {
 	const hiNotFound = 1<<31 - 1

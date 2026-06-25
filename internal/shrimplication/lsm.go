@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maypok86/otter"
+	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
 )
@@ -70,7 +71,7 @@ type LSM struct {
 
 	idxEngine *IndexEngine // Separate Index Engine
 
-	rowBlockCache otter.Cache[shrimptypes.RowCacheKey, *shrimptypes.RowBlock] // keyed by (partID, block index)
+	rowBlockCache otter.Cache[shrimptypes.RowCacheKey, *shrimpblock.BinBlock] // keyed by (partID, block index)
 	partMgr       *PartManager                                                // manages open V2 part files
 }
 
@@ -97,9 +98,9 @@ func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg registryAPI) (
 		return nil, fmt.Errorf("new index engine: %w", err)
 	}
 
-	rowBlockCache, _ := otter.MustBuilder[shrimptypes.RowCacheKey, *shrimptypes.RowBlock](256 << 20).
-		Cost(func(_ shrimptypes.RowCacheKey, rb *shrimptypes.RowBlock) uint32 {
-			return rb.Cost
+	rowBlockCache, _ := otter.MustBuilder[shrimptypes.RowCacheKey, *shrimpblock.BinBlock](256 << 20).
+		Cost(func(_ shrimptypes.RowCacheKey, bb *shrimpblock.BinBlock) uint32 {
+			return bb.HeapCost()
 		}).
 		Build()
 
