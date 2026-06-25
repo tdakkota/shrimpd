@@ -822,7 +822,9 @@ func TestDaemonIndexE2E(t *testing.T) {
 			hasIndexPart := false
 			hasCoveredJSON := false
 			for _, f := range files {
-				if strings.HasSuffix(f.Name(), ".json") && f.Name() != "covered.json" {
+				// Index parts are stored as FST files (<id>.fst) since the
+				// vellum migration; covered.json tracks indexed data parts.
+				if strings.HasSuffix(f.Name(), ".fst") {
 					hasIndexPart = true
 				}
 				if f.Name() == "covered.json" {
