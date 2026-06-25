@@ -83,4 +83,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/go-faster/gooners
+        - github.com/tdakkota/shrimpd

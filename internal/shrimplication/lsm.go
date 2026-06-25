@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maypok86/otter"
+
 	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"

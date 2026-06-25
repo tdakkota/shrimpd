@@ -18,11 +18,12 @@ import (
 
 	"github.com/go-faster/jx"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+
 	"github.com/tdakkota/shrimpd/internal/shrimplication"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
-	"go.opentelemetry.io/collector/pdata/pcommon"
-	"go.opentelemetry.io/collector/pdata/plog"
 )
 
 func TestDecodeEntryJSON(t *testing.T) {

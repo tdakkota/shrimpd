@@ -9,6 +9,7 @@ import (
 
 	"github.com/blevesearch/vellum"
 	"github.com/stretchr/testify/require"
+
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 

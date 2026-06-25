@@ -10,8 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
 // etcd key schema:

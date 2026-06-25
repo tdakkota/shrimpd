@@ -28,6 +28,16 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func requireE2E(t testing.TB) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("E2E test disabled in short mode")
+	}
+	if os.Getenv("E2E") != "1" {
+		t.Skip("E2E test disabled; set E2E=1 to enable")
+	}
+}
+
 func startEtcd(ctx context.Context, t testing.TB) string {
 	t.Helper()
 	sharedEtcdOnce.Do(func() {

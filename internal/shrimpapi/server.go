@@ -19,12 +19,13 @@ import (
 
 	"github.com/CAFxX/httpcompression"
 	"github.com/go-faster/jx"
-	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+
+	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
 // Server serves the daemon HTTP API for ingesting, reading, and sharing parts.

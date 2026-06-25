@@ -17,20 +17,18 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/tdakkota/shrimpd/internal/shrimpapi"
 	"github.com/tdakkota/shrimpd/internal/shrimplication"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.opentelemetry.io/collector/pdata/plog"
-	"golang.org/x/sync/errgroup"
 )
 
 func TestDaemonSmoke(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -89,10 +87,7 @@ func TestDaemonSmoke(t *testing.T) {
 }
 
 func TestDaemonSmokeOTLP(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -304,10 +299,7 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 }
 
 func TestDaemonReplication(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -433,10 +425,7 @@ func TestDaemonReplication(t *testing.T) {
 }
 
 func TestNewNodeBootstrap(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -499,10 +488,7 @@ func TestNewNodeBootstrap(t *testing.T) {
 }
 
 func TestLogTruncation(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -553,10 +539,7 @@ func TestLogTruncation(t *testing.T) {
 }
 
 func TestRecoveringNode(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -660,10 +643,7 @@ func TestRecoveringNode(t *testing.T) {
 }
 
 func TestShrimplyCLI(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -747,10 +727,7 @@ func TestShrimplyCLI(t *testing.T) {
 }
 
 func TestDaemonIndexE2E(t *testing.T) {
-	if testing.Short() {
-		t.Skip("E2E test for short testing")
-		return
-	}
+	requireE2E(t)
 	must := require.New(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
 	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
@@ -166,6 +167,13 @@ func BenchmarkMergeParts(b *testing.B) {
 	)
 	payload := strings.Repeat("x", 1024)
 	parts := make([]*PartFileV2, 0, partCount)
+	b.Cleanup(func() {
+		for _, pf := range parts {
+			if err := pf.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 	for part := range partCount {
 		entries := make([]shrimptypes.Entry, entriesPerPart)
 		for i := range entries {
@@ -183,7 +191,6 @@ func BenchmarkMergeParts(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		defer pf.Close()
 		parts = append(parts, pf)
 	}
 

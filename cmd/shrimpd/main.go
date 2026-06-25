@@ -49,16 +49,16 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/tdakkota/shrimpd/internal/shrimpapi"
-	"github.com/tdakkota/shrimpd/internal/shrimplication"
-	shrimpwal "github.com/tdakkota/shrimpd/internal/shrimpwal"
-
 	slogmulti "github.com/samber/slog-multi"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/sdk/log"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/tdakkota/shrimpd/internal/shrimpapi"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	shrimpwal "github.com/tdakkota/shrimpd/internal/shrimpwal"
 )
 
 // bytesFlag is a custom flag type that allows human-readable byte sizes (e.g., "10MB") to be parsed into uint64 values.
