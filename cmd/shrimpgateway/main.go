@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 func main() {
@@ -72,12 +74,18 @@ func newGateway(targets []*url.URL, logger *slog.Logger) http.Handler {
 		lw := &loggingResponseWriter{ResponseWriter: w}
 
 		target := targets[(next.Add(1)-1)%uint32(len(targets))]
-		requestLogger := logger.With(
+		fields := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
 			"content_length", r.ContentLength,
+			"content_length_human", humanize.Bytes(uint64(r.ContentLength)),
 			"upstream", target.String(),
-		)
+		}
+		if r.Header.Get("Content-Type") != "" {
+			fields = append(fields, "content_type", r.Header.Get("Content-Type"))
+		}
+		logger.Debug("gateway request received", fields...)
+		requestLogger := logger.With(fields...)
 
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = transport
@@ -89,6 +97,8 @@ func newGateway(targets []*url.URL, logger *slog.Logger) http.Handler {
 		requestLogger.Info("gateway request",
 			"status", lw.status,
 			"response_length", lw.bytes,
+			"response_length_human", humanize.Bytes(uint64(lw.bytes)),
+			"duration", time.Since(start).String(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
