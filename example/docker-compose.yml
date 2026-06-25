@@ -23,7 +23,7 @@ services:
   gateway:
     build: ..
     image: tdakkota/shrimpd:latest
-    entrypoint: ["/shrimpgateway"]
+    entrypoint: [ "/shrimpgateway" ]
     command:
       - -addr=:8080
       - -upstreams=http://shrimpd-1:8080,http://shrimpd-2:8080,http://shrimpd-3:8080
@@ -52,9 +52,9 @@ services:
       - -data=/data
       - -etcd=etcd:2379
       - -pprof=:6060
-      - -memlimit=419430400        # 400 MiB — triggers aggressive GC before cgroup kills
+      - -memlimit=800MiB # 800 MiB — triggers aggressive GC before cgroup kills
       - -memprofile-dir=/profiles
-      - -memprofile-threshold=314572800  # dump at 300 MiB heap_inuse
+      - -memprofile-threshold=500MiB # dump at 500 MiB heap_inuse
     expose:
       - "8080"
     ports:
@@ -68,8 +68,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
-          memory: 512M
+          cpus: '2'
+          memory: 4G
   shrimpd-2:
     build: ..
     image: tdakkota/shrimpd:latest
@@ -81,9 +81,9 @@ services:
       - -data=/data
       - -etcd=etcd:2379
       - -pprof=:6060
-      - -memlimit=419430400
+      - -memlimit=800MiB # 800 MiB — triggers aggressive GC before cgroup kills
       - -memprofile-dir=/profiles
-      - -memprofile-threshold=314572800
+      - -memprofile-threshold=500MiB # dump at 500 MiB heap_inuse
     expose:
       - "8080"
     ports:
@@ -97,8 +97,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
-          memory: 512M
+          cpus: '2'
+          memory: 4G
   shrimpd-3:
     build: ..
     image: tdakkota/shrimpd:latest
@@ -110,9 +110,9 @@ services:
       - -data=/data
       - -etcd=etcd:2379
       - -pprof=:6060
-      - -memlimit=419430400
+      - -memlimit=800MiB # 800 MiB — triggers aggressive GC before cgroup kills
       - -memprofile-dir=/profiles
-      - -memprofile-threshold=314572800
+      - -memprofile-threshold=500MiB # dump at 500 MiB heap_inuse
     expose:
       - "8080"
     ports:
@@ -126,5 +126,5 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1'
-          memory: 512M
+          cpus: '2'
+          memory: 4G
