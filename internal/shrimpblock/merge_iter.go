@@ -92,7 +92,7 @@ func MergeParts(parts []*PartFileV2) iter.Seq2[shrimptypes.Entry, error] {
 		heap.Init(&h)
 		for h.Len() > 0 {
 			c := h[0]
-			entry := shrimptypes.Entry{Timestamp: c.ts, Data: string(c.bb.DataBytes(c.idx))}
+			entry := shrimptypes.Entry{Timestamp: c.ts, Data: bytesString(c.bb.DataBytes(c.idx))}
 			if !yield(entry, nil) {
 				return
 			}

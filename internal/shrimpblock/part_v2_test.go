@@ -1,9 +1,11 @@
 package shrimpblock
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -154,6 +156,48 @@ func TestMergeParts(t *testing.T) {
 		got = append(got, e.Timestamp)
 	}
 	require.Equal(t, []int64{1, 2, 3, 4, 5, 6}, got)
+}
+
+func BenchmarkMergeParts(b *testing.B) {
+	dir := b.TempDir()
+	const (
+		partCount      = 4
+		entriesPerPart = 1024
+	)
+	payload := strings.Repeat("x", 1024)
+	parts := make([]*PartFileV2, 0, partCount)
+	for part := range partCount {
+		entries := make([]shrimptypes.Entry, entriesPerPart)
+		for i := range entries {
+			entries[i] = shrimptypes.Entry{
+				Timestamp: int64(i*partCount + part),
+				Data:      fmt.Sprintf("part=%d row=%d %s", part, i, payload),
+			}
+		}
+		path := filepath.Join(dir, fmt.Sprintf("p%d.json", part))
+		_, err := WritePartV2(path, entries)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pf, err := OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer pf.Close()
+		parts = append(parts, pf)
+	}
+
+	b.ReportAllocs()
+	var total int
+	for b.Loop() {
+		for e, err := range MergeParts(parts) {
+			if err != nil {
+				b.Fatal(err)
+			}
+			total += len(e.Data)
+		}
+	}
+	_ = total
 }
 
 func TestWritePartV2FromIter(t *testing.T) {

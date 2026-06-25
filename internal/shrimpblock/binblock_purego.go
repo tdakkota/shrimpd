@@ -4,6 +4,10 @@ package shrimpblock
 
 import "encoding/binary"
 
+func bytesString(b []byte) string {
+	return string(b)
+}
+
 func tsFromBuf(buf []byte, count int) []int64 {
 	ts := make([]int64, count)
 	for i := range count {
