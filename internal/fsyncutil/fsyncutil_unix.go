@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package fsyncutil provides a utility function to fsync a directory so that a rename is durable on disk.
 package fsyncutil
 
@@ -8,7 +10,7 @@ import (
 
 // SyncDir fsyncs a directory so a rename is durable on disk.
 func SyncDir(path string) error {
-	d, err := os.Open(path) //#nosec G304 -- it's verified this is a directory
+	d, err := os.Open(path) // #nosec G304 -- it's verified this is a directory
 	if err != nil {
 		return err
 	}
