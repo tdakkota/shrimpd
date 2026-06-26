@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maypok86/otter"
@@ -25,6 +26,8 @@ const (
 )
 
 var remoteHTTP = &http.Client{Timeout: 10 * time.Second}
+
+var partIDCounters sync.Map // map[string]*atomic.Uint64
 
 type registryAPI interface {
 	RegisterNode(ctx context.Context, addr string) error
@@ -204,5 +207,7 @@ func (l *LSM) Run(ctx context.Context) error {
 }
 
 func newPartID(nodeID string) string {
-	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), nodeID)
+	counterAny, _ := partIDCounters.LoadOrStore(nodeID, &atomic.Uint64{})
+	counter := counterAny.(*atomic.Uint64).Add(1)
+	return fmt.Sprintf("%d-%d-%s", time.Now().UnixNano(), counter, nodeID)
 }
