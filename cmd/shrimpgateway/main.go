@@ -1,17 +1,23 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/go-faster/sdk/app"
+	slogzap "github.com/samber/slog-zap/v2"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -21,31 +27,41 @@ func main() {
 	)
 	flag.Parse()
 
-	lg := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(lg)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+	app.Run(func(ctx context.Context, lg *zap.Logger, _ *app.Telemetry) error {
+		slogLogger := slog.New(slogzap.Option{Level: slog.LevelInfo, Logger: lg}.NewZapHandler())
+		slog.SetDefault(slogLogger)
 
-	targets, err := parseUpstreams(*upstreams)
-	if err != nil {
-		lg.Error("parse upstreams", "error", err)
-		os.Exit(1)
-	}
-	if len(targets) == 0 {
-		lg.Error("no upstreams configured")
-		os.Exit(1)
-	}
+		targets, err := parseUpstreams(*upstreams)
+		if err != nil {
+			return err
+		}
+		if len(targets) == 0 {
+			return errors.New("no upstreams configured")
+		}
 
-	proxy := newGateway(targets, lg)
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           proxy,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+		proxy := newGateway(targets, slogLogger)
+		srv := &http.Server{
+			Addr:              *addr,
+			Handler:           proxy,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				slogLogger.Warn("gateway shutdown", "error", err)
+			}
+		}()
 
-	lg.Info("gateway listening", "addr", *addr, "upstreams", len(targets))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		lg.Error("gateway exit", "error", err)
-		os.Exit(1)
-	}
+		slogLogger.Info("gateway listening", "addr", *addr, "upstreams", len(targets))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return ctx.Err()
+	}, app.WithContext(ctx), app.WithServiceName("shrimpgateway"))
 }
 
 func parseUpstreams(raw string) ([]*url.URL, error) {

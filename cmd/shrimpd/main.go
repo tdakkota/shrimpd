@@ -36,8 +36,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
-	httpprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -49,11 +47,10 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	slogmulti "github.com/samber/slog-multi"
+	"github.com/go-faster/sdk/app"
+	slogzap "github.com/samber/slog-zap/v2"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.opentelemetry.io/contrib/bridges/otelslog"
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
-	"go.opentelemetry.io/otel/sdk/log"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/oteldb/shrimpd/internal/shrimpapi"
@@ -104,6 +101,12 @@ func main() {
 		memLimit           = BytesFlag("memlimit", "0", "soft memory limit in bytes passed to runtime/debug.SetMemoryLimit (0 = runtime default); also respects GOMEMLIMIT env var")
 	)
 	flag.Parse()
+	if *pprofAddr != "" {
+		if err := os.Setenv("PPROF_ADDR", *pprofAddr); err != nil {
+			slog.Error("set pprof addr", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	// Apply soft memory limit before anything allocates.
 	if *memLimit > 0 {
@@ -128,97 +131,57 @@ func main() {
 		}()
 	}
 
-	consoleHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	var handler slog.Handler = consoleHandler
-
-	shutdown, otelHandler, err := initOTEL(context.Background(), *nodeID)
-	if err != nil {
-		slog.Warn("failed to initialize OpenTelemetry logging, falling back to console-only", "error", err)
-	} else if otelHandler != nil {
-		handler = slogmulti.Fanout(consoleHandler, otelHandler)
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := shutdown(shutdownCtx); err != nil {
-				slog.Warn("failed to shutdown OpenTelemetry LoggerProvider", "error", err)
-			}
-		}()
-	}
-
-	slog.SetDefault(slog.New(handler))
-
-	if err := os.MkdirAll(*dataDir+"/parts", 0o750); err != nil {
-		slog.Error("create data directory", "error", err)
-		os.Exit(1)
-	}
-
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   strings.Split(*etcdEps, ","),
-		DialTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		slog.Error("connect etcd", "error", err)
-		os.Exit(1)
-	}
-	defer func() {
-		if err := cli.Close(); err != nil {
-			slog.Warn("close etcd client", "error", err)
-		}
-	}()
-
-	wal, err := shrimpwal.OpenWAL(*dataDir + "/wal.jsonl")
-	if err != nil {
-		slog.Error("open wal", "error", err)
-		os.Exit(1)
-	}
-	defer func() {
-		if err := wal.Close(); err != nil {
-			slog.Warn("close wal", "error", err)
-		}
-	}()
-	reg := shrimplication.NewRegistry(cli, *nodeID)
-
-	lsm, err := shrimplication.NewLSM(*nodeID, *addr, *dataDir, wal, reg)
-	if err != nil {
-		slog.Error("create lsm", "error", err)
-		os.Exit(1)
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
+	app.Run(func(ctx context.Context, lg *zap.Logger, _ *app.Telemetry) error {
+		slog.SetDefault(slog.New(slogzap.Option{Level: slog.LevelDebug, Logger: lg}.NewZapHandler()))
 
-	// pprof HTTP server (separate from the main API server).
-	if *pprofAddr != "" {
-		go func() {
-			mux := http.NewServeMux()
-			mux.HandleFunc("GET /debug/pprof/", httpprof.Index)
-			mux.HandleFunc("GET /debug/pprof/cmdline", httpprof.Cmdline)
-			mux.HandleFunc("GET /debug/pprof/profile", httpprof.Profile)
-			mux.HandleFunc("GET /debug/pprof/symbol", httpprof.Symbol)
-			mux.HandleFunc("GET /debug/pprof/trace", httpprof.Trace)
-			slog.Info("pprof listening", "addr", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, mux); err != nil { // #nosec G114
-				slog.Error("pprof server", "error", err)
+		if err := os.MkdirAll(*dataDir+"/parts", 0o750); err != nil {
+			return fmt.Errorf("create data directory: %w", err)
+		}
+
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   strings.Split(*etcdEps, ","),
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("connect etcd: %w", err)
+		}
+		defer func() {
+			if err := cli.Close(); err != nil {
+				slog.Warn("close etcd client", "error", err)
 			}
 		}()
-	}
 
-	// Background heap monitor: auto-dump when threshold crossed, and on SIGUSR1.
-	if *memProfileDir != "" {
-		if err := os.MkdirAll(*memProfileDir, 0o750); err != nil {
-			slog.Error("create memprofile dir", "error", err)
-			os.Exit(1)
+		wal, err := shrimpwal.OpenWAL(*dataDir + "/wal.jsonl")
+		if err != nil {
+			return fmt.Errorf("open wal: %w", err)
 		}
-		go heapMonitor(ctx, *memProfileDir, uint64(*memProfileThresh), *memProfileInterval)
-	}
+		defer func() {
+			if err := wal.Close(); err != nil {
+				slog.Warn("close wal", "error", err)
+			}
+		}()
+		reg := shrimplication.NewRegistry(cli, *nodeID)
 
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error { return lsm.Run(ctx) })
-	eg.Go(func() error { return shrimpapi.NewServer(*addr, lsm).Run(ctx) })
+		lsm, err := shrimplication.NewLSM(*nodeID, *addr, *dataDir, wal, reg)
+		if err != nil {
+			return fmt.Errorf("create lsm: %w", err)
+		}
 
-	if err := eg.Wait(); err != nil && err != context.Canceled {
-		slog.Error("exit", "error", err)
-	}
+		// Background heap monitor: auto-dump when threshold crossed, and on SIGUSR1.
+		if *memProfileDir != "" {
+			if err := os.MkdirAll(*memProfileDir, 0o750); err != nil {
+				return fmt.Errorf("create memprofile dir: %w", err)
+			}
+			go heapMonitor(ctx, *memProfileDir, uint64(*memProfileThresh), *memProfileInterval)
+		}
+
+		eg, ctx := errgroup.WithContext(ctx)
+		eg.Go(func() error { return lsm.Run(ctx) })
+		eg.Go(func() error { return shrimpapi.NewServer(*addr, lsm).Run(ctx) })
+		return eg.Wait()
+	}, app.WithContext(ctx), app.WithServiceName("shrimpd"))
 }
 
 // heapMonitor polls heap stats and writes a heap profile when HeapInuse exceeds
@@ -285,28 +248,4 @@ func heapMonitor(ctx context.Context, dir string, threshold uint64, interval tim
 			}
 		}
 	}
-}
-
-func initOTEL(ctx context.Context, nodeID string) (func(context.Context) error, slog.Handler, error) {
-	if os.Getenv("OTEL_LOGS_EXPORTER") == "none" {
-		return func(_ context.Context) error { return nil }, nil, nil
-	}
-
-	exporter, err := otlploghttp.New(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	processor := log.NewBatchProcessor(exporter, log.WithExportInterval(1*time.Second))
-	provider := log.NewLoggerProvider(
-		log.WithProcessor(processor),
-	)
-
-	otelHandler := otelslog.NewHandler(nodeID, otelslog.WithLoggerProvider(provider))
-
-	shutdown := func(shutdownCtx context.Context) error {
-		return provider.Shutdown(shutdownCtx)
-	}
-
-	return shutdown, otelHandler, nil
 }
