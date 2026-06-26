@@ -11,6 +11,8 @@ import (
 	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
 
+const logReplicationPageLimit = 1024
+
 func (l *LSM) startup(ctx context.Context) error {
 	if err := l.reg.RegisterNode(ctx, l.addr); err != nil {
 		return fmt.Errorf("register: %w", err)
@@ -160,38 +162,49 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 				}
 			}
 
-			entries, err := l.reg.GetLogs(ctx, pointer+1)
-			if err != nil {
-				slog.WarnContext(ctx, "failed to get logs from etcd", "error", err)
-				continue
-			}
-
-			for _, entry := range entries {
-				if entry.Index <= pointer {
-					continue
+			for {
+				entries, err := l.reg.GetLogs(ctx, pointer+1, logReplicationPageLimit)
+				if err != nil {
+					slog.WarnContext(ctx, "failed to get logs from etcd", "error", err)
+					break
 				}
-
-				if entry.Index > pointer+1 {
-					// Log gap detected (e.g. after truncation while offline). Bootstrap from parts.
-					slog.WarnContext(ctx, "log gap detected in replication", "expected", pointer+1, "got", entry.Index)
-					if err := l.bootstrapFromParts(ctx); err != nil {
-						slog.WarnContext(ctx, "bootstrap from parts after gap failed", "error", err)
-					} else if p, err := l.reg.GetQueuePointer(ctx); err == nil {
-						pointer = p
-					} else {
-						slog.WarnContext(ctx, "failed to update queue pointer", "error", err)
-					}
+				if len(entries) == 0 {
 					break
 				}
 
-				if err := l.applyLogEntry(ctx, entry, peers); err != nil {
-					slog.ErrorContext(ctx, "failed to apply log entry", "index", entry.Index, "op", entry.Op, "error", err)
-					break // Retry from the same pointer next time
-				}
+				appliedAll := true
+				for _, entry := range entries {
+					if entry.Index <= pointer {
+						continue
+					}
 
-				pointer = entry.Index
-				if err := l.reg.SetQueuePointer(ctx, pointer); err != nil {
-					slog.WarnContext(ctx, "failed to save queue pointer", "pointer", pointer, "error", err)
+					if entry.Index > pointer+1 {
+						// Log gap detected (e.g. after truncation while offline). Bootstrap from parts.
+						slog.WarnContext(ctx, "log gap detected in replication", "expected", pointer+1, "got", entry.Index)
+						if err := l.bootstrapFromParts(ctx); err != nil {
+							slog.WarnContext(ctx, "bootstrap from parts after gap failed", "error", err)
+						} else if p, err := l.reg.GetQueuePointer(ctx); err == nil {
+							pointer = p
+						} else {
+							slog.WarnContext(ctx, "failed to update queue pointer", "error", err)
+						}
+						appliedAll = false
+						break
+					}
+
+					if err := l.applyLogEntry(ctx, entry, peers); err != nil {
+						slog.ErrorContext(ctx, "failed to apply log entry", "index", entry.Index, "op", entry.Op, "error", err)
+						appliedAll = false
+						break // Retry from the same pointer next time
+					}
+
+					pointer = entry.Index
+					if err := l.reg.SetQueuePointer(ctx, pointer); err != nil {
+						slog.WarnContext(ctx, "failed to save queue pointer", "pointer", pointer, "error", err)
+					}
+				}
+				if !appliedAll || len(entries) < logReplicationPageLimit {
+					break
 				}
 			}
 		}

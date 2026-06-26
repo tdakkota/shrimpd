@@ -32,7 +32,7 @@ var partIDCounters sync.Map // map[string]*atomic.Uint64
 type registryAPI interface {
 	RegisterNode(ctx context.Context, addr string) error
 	AppendLog(ctx context.Context, op LogOp, part shrimptypes.PartMeta, oldParts []string) (int64, error)
-	GetLogs(ctx context.Context, fromIndex int64) ([]LogEntry, error)
+	GetLogs(ctx context.Context, fromIndex, limit int64) ([]LogEntry, error)
 	GetActiveParts(ctx context.Context) (map[string]shrimptypes.PartMeta, error)
 	GetBootstrapSnapshot(ctx context.Context) (BootstrapSnapshot, error)
 	logEntryExists(ctx context.Context, idx int64) (bool, error)

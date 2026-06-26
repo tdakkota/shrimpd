@@ -245,12 +245,19 @@ func (r *Registry) deleteOldParts(ctx context.Context, oldIDs []string) error {
 	return fmt.Errorf("deleteOldParts: too many retries")
 }
 
-// GetLogs retrieves sequential log entries starting from a given index (inclusive).
-func (r *Registry) GetLogs(ctx context.Context, fromIndex int64) ([]LogEntry, error) {
+// GetLogs retrieves up to limit sequential log entries starting from a given index (inclusive).
+func (r *Registry) GetLogs(ctx context.Context, fromIndex, limit int64) ([]LogEntry, error) {
 	startKey := fmt.Sprintf("%s/%016d", logPrefix, fromIndex)
 	endKey := fmt.Sprintf("%s/%016d", logPrefix, 9999999999999999)
+	if limit <= 0 {
+		limit = 1
+	}
 
-	resp, err := r.cli.Get(ctx, startKey, clientv3.WithRange(endKey), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	resp, err := r.cli.Get(ctx, startKey,
+		clientv3.WithRange(endKey),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+		clientv3.WithLimit(limit),
+	)
 	if err != nil {
 		return nil, err
 	}

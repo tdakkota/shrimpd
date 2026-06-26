@@ -22,8 +22,8 @@ type stubRegistry struct {
 	bootstrapSnap BootstrapSnapshot
 }
 
-func (s *stubRegistry) RegisterNode(context.Context, string) error         { return nil }
-func (s *stubRegistry) GetLogs(context.Context, int64) ([]LogEntry, error) { return nil, nil }
+func (s *stubRegistry) RegisterNode(context.Context, string) error                { return nil }
+func (s *stubRegistry) GetLogs(context.Context, int64, int64) ([]LogEntry, error) { return nil, nil }
 func (s *stubRegistry) GetActiveParts(context.Context) (map[string]shrimptypes.PartMeta, error) {
 	return nil, nil
 }
