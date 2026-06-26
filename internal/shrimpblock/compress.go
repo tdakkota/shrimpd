@@ -36,7 +36,7 @@ var encoderPool = sync.Pool{
 
 var decoderPool = sync.Pool{
 	New: func() any {
-		d, err := zstd.NewReader(nil)
+		d, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
 		if err != nil {
 			panic(fmt.Sprintf("zstd new reader: %v", err))
 		}

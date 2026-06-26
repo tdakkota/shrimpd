@@ -288,6 +288,9 @@ func ReadBinBlock(pf *PartFileV2, idx int) (*BinBlock, error) {
 		_ = dec.Reset(nil)
 		decoderPool.Put(dec)
 	}()
+	if err := dec.ResetWithOptions(nil, zstd.WithDecoderConcurrency(1)); err != nil {
+		return nil, fmt.Errorf("reset zstd decoder: %w", err)
+	}
 
 	decoded, err := dec.DecodeAll(compressed, nil)
 	if err != nil {

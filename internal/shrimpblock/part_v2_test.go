@@ -159,6 +159,8 @@ func TestMergeParts(t *testing.T) {
 	require.Equal(t, []int64{1, 2, 3, 4, 5, 6}, got)
 }
 
+var sink any
+
 func BenchmarkMergeParts(b *testing.B) {
 	dir := b.TempDir()
 	const (
@@ -195,12 +197,15 @@ func BenchmarkMergeParts(b *testing.B) {
 	}
 
 	b.ReportAllocs()
+	b.ResetTimer()
+
 	var total int
 	for b.Loop() {
 		for e, err := range MergeParts(parts) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			sink = e.Data
 			total += len(e.Data)
 		}
 	}
