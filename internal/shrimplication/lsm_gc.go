@@ -76,11 +76,6 @@ func (l *LSM) runGC(ctx context.Context) error {
 		}
 	}
 
-	// Evict deleted parts from caches
-	for id := range active {
-		_ = id // parts still active, keep in cache
-	}
-
 	// Safely reconcile local l.parts without dropping recently flushed parts
 	l.mu.Lock()
 	var reconciled []shrimptypes.PartMeta
