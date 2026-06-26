@@ -186,7 +186,7 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part shrimptypes.Par
 			// Delete any remaining old parts that didn't fit in the first transaction.
 			if len(remaining) > 0 {
 				if err := r.deleteOldParts(ctx, remaining); err != nil {
-					return newSeqNum, fmt.Errorf("delete old parts: %w", err)
+					slog.WarnContext(ctx, "delete old parts after committed merge failed", "index", newSeqNum, "error", err)
 				}
 			}
 			return newSeqNum, nil
