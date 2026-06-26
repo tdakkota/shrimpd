@@ -112,7 +112,7 @@ type BlockHeader struct {
 	Count        int32 // number of rows in this block
 	MinTimestamp int64
 	MaxTimestamp int64
-	Bloom        BloomFilter // 8192-bit blocked bloom filter, k=4
+	Bloom        BloomFilter // 8192-bit bloom filter, k=4, label tokens only (lbl:k=v)
 }
 
 const (
@@ -124,8 +124,11 @@ const (
 	BloomK = 4
 )
 
-// BloomFilter is a fixed-size 8192-bit blocked bloom filter, k=4.
-// It is used to quickly check whether a token might be present in a block of data.
+// BloomFilter is a fixed-size 8192-bit bloom filter, k=4.
+// Only label tokens of the form "lbl:key=value" are stored; text tokens are omitted
+// because a fixed 8192-bit filter with k=4 saturates at ~10 k distinct text tokens
+// (FP ≈ 0.97) making it useless for text pruning. Label cardinality is far lower,
+// so the filter remains effective for label-equality pruning.
 type BloomFilter [BloomBytes]byte
 
 // RowCacheKey is the cache key for BinBlock caching.

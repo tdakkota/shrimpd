@@ -69,10 +69,7 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 				stats.BlocksPrunedByTS++
 				continue
 			}
-			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-				stats.BlocksPrunedByBloom++
-				continue
-			}
+			// Note: block bloom is label-only; text-term pruning is at part level via HasToken.
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}
@@ -167,10 +164,7 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 				stats.BlocksPrunedByTS++
 				continue
 			}
-			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-				stats.BlocksPrunedByBloom++
-				continue
-			}
+			// Note: block bloom is label-only; text-term pruning is at part level via HasToken.
 			stats.BlocksScanned++
 
 			ck := shrimptypes.RowCacheKey{PartID: meta.ID, Block: i}

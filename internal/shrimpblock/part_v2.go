@@ -101,11 +101,13 @@ func writePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSi
 		if err != nil {
 			return err
 		}
+		// Build a label-only bloom filter for this block.
+		// Text-token bloom is omitted: a fixed 8192-bit filter with k=4 saturates
+		// at ~10 k distinct tokens (FP ≈ 0.97) and prunes nothing on real log data.
+		// Label cardinality (lbl:k=v) is far lower so the bloom stays effective.
+		// Text-term pruning is handled at the part level via PartMeta.Tokens.
 		var bloom shrimptypes.BloomFilter
 		for _, e := range block {
-			for tok := range Tokenize(e.Data) {
-				BloomAdd(&bloom, tok)
-			}
 			labels := shrimpfilter.ExtractLabels(e.Data)
 			for k, v := range labels {
 				BloomAddLabel(&bloom, k, v)
