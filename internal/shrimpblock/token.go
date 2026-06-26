@@ -55,6 +55,35 @@ func BuildTokenSet(entries []shrimptypes.Entry) ([]string, bool) {
 	return out, false
 }
 
+// BuildTokenSetFromPart builds a capped token set by walking a V2 part file.
+func BuildTokenSetFromPart(pf *PartFileV2) ([]string, bool) {
+	var (
+		seen = make(map[string]struct{})
+		out  []string
+	)
+	for bi := range pf.Headers {
+		bb, err := ReadBinBlock(pf, bi)
+		if err != nil {
+			continue
+		}
+		for i := range bb.TS {
+			for tok := range Tokenize(string(bb.DataBytes(i))) {
+				if _, ok := seen[tok]; ok {
+					continue
+				}
+				if len(seen) == MaxTokenSetSize {
+					slices.Sort(out)
+					return out, true
+				}
+				seen[tok] = struct{}{}
+				out = append(out, tok)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out, false
+}
+
 // HasToken checks if the given term can be satisfied by the provided sorted token list.
 func HasToken(tokens []string, term string) bool {
 	if term == "" || len(tokens) == 0 {

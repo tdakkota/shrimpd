@@ -48,6 +48,10 @@ func (l *LSM) startup(ctx context.Context) error {
 			return err
 		}
 		meta.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(l.partPath(id), &meta); err != nil {
+			_ = os.Remove(l.partPath(id))
+			return fmt.Errorf("rebuild tokens: %w", err)
+		}
 		if err := WriteMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return err
@@ -101,6 +105,21 @@ func (l *LSM) startup(ctx context.Context) error {
 	}
 
 	slog.InfoContext(ctx, "bootstrapped from etcd parts", "log_index", snap.LogIndex, "count", len(loaded))
+	return nil
+}
+
+func rebuildPartTokens(path string, meta *shrimptypes.PartMeta) error {
+	pf, err := shrimpblock.OpenPartV2(path, *meta)
+	if err != nil {
+		return err
+	}
+	if pf == nil {
+		return fmt.Errorf("part not found: %s", meta.ID)
+	}
+	defer func() { _ = pf.Close() }()
+
+	meta.Tokens, meta.TokensTruncated = shrimpblock.BuildTokenSetFromPart(pf)
+	meta.BlockCount = len(pf.Headers)
 	return nil
 }
 
@@ -213,6 +232,10 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 			return fmt.Errorf("write part: %w", err)
 		}
 		meta.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(l.partPath(id), &meta); err != nil {
+			_ = os.Remove(l.partPath(id))
+			return fmt.Errorf("rebuild tokens: %w", err)
+		}
 		if err := WriteMeta(l.partMetaPath(id), meta); err != nil {
 			_ = os.Remove(l.partPath(id))
 			return fmt.Errorf("write meta: %w", err)
@@ -275,6 +298,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string)
 			return fmt.Errorf("write part: %w", err)
 		}
 		entry.Part.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(path, &entry.Part); err != nil {
+			_ = os.Remove(path)
+			return fmt.Errorf("rebuild tokens: %w", err)
+		}
 		if err := WriteMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -313,6 +340,10 @@ func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry, peers []string)
 			return fmt.Errorf("write part: %w", err)
 		}
 		entry.Part.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(path, &entry.Part); err != nil {
+			_ = os.Remove(path)
+			return fmt.Errorf("rebuild tokens: %w", err)
+		}
 		if err := WriteMeta(metaPath, entry.Part); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write meta: %w", err)
@@ -435,6 +466,12 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 			continue
 		}
 		w.meta.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(l.partPath(w.id), &w.meta); err != nil {
+			_ = os.Remove(l.partPath(w.id))
+			slog.WarnContext(ctx, "pending part: rebuild tokens failed", "id", w.id, "error", err)
+			l.bumpPendingBackoff(w.id, now)
+			continue
+		}
 		if err := WriteMeta(l.partMetaPath(w.id), w.meta); err != nil {
 			_ = os.Remove(l.partPath(w.id))
 			slog.WarnContext(ctx, "pending part: write meta failed", "id", w.id, "error", err)
