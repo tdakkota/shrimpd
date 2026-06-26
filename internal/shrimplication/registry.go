@@ -337,14 +337,19 @@ func (r *Registry) LogCleanup(ctx context.Context) error {
 		return err
 	}
 	minPtr := int64(-1)
+	coordinator := ""
 	for _, id := range active {
 		p := int64(0)
 		if v, ok := ptrs[id]; ok {
 			p = v
 		}
-		if minPtr < 0 || p < minPtr {
+		if minPtr < 0 || p < minPtr || (p == minPtr && id < coordinator) {
 			minPtr = p
+			coordinator = id
 		}
+	}
+	if coordinator != r.nodeID {
+		return nil
 	}
 	if minPtr <= 0 {
 		return nil
