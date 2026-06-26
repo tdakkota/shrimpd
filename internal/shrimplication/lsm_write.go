@@ -79,18 +79,20 @@ func (l *LSM) flush(ctx context.Context) error {
 		return fmt.Errorf("write v2 part: %w", err)
 	}
 
+	tokens, tokensTruncated := shrimpblock.BuildTokenSet(entries)
 	meta := shrimptypes.PartMeta{
-		ID:            id,
-		NodeID:        l.nodeID,
-		Level:         0,
-		MinTimestamp:  entries[0].Timestamp,
-		MaxTimestamp:  entries[len(entries)-1].Timestamp,
-		Count:         len(entries),
-		Addr:          l.addr,
-		Tokens:        shrimpblock.BuildTokenSet(entries),
-		Compression:   shrimpblock.CompressionZstd,
-		FormatVersion: 1,
-		BlockCount:    len(blockHeaders),
+		ID:              id,
+		NodeID:          l.nodeID,
+		Level:           0,
+		MinTimestamp:    entries[0].Timestamp,
+		MaxTimestamp:    entries[len(entries)-1].Timestamp,
+		Count:           len(entries),
+		Addr:            l.addr,
+		Tokens:          tokens,
+		TokensTruncated: tokensTruncated,
+		Compression:     shrimpblock.CompressionZstd,
+		FormatVersion:   1,
+		BlockCount:      len(blockHeaders),
 	}
 
 	if err := WriteMeta(metaPath, meta); err != nil {

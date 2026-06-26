@@ -1,6 +1,7 @@
 package shrimpblock
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -28,9 +29,21 @@ func TestTokenize(t *testing.T) {
 
 func TestBuildTokenSet(t *testing.T) {
 	ents := []shrimptypes.Entry{{Data: "Hello World"}, {Data: "hello foo"}}
-	got := BuildTokenSet(ents)
+	got, truncated := BuildTokenSet(ents)
 	want := []string{"foo", "hello", "world"}
 	require.Equal(t, want, got)
+	require.False(t, truncated)
+}
+
+func TestBuildTokenSetTruncated(t *testing.T) {
+	ents := make([]shrimptypes.Entry, 0, MaxTokenSetSize+1)
+	for i := range MaxTokenSetSize + 1 {
+		ents = append(ents, shrimptypes.Entry{Data: fmt.Sprintf("tok%d", i)})
+	}
+
+	tokens, truncated := BuildTokenSet(ents)
+	require.Len(t, tokens, MaxTokenSetSize)
+	require.True(t, truncated)
 }
 
 func TestHasToken(t *testing.T) {
@@ -47,9 +60,10 @@ func TestTokenPruning(t *testing.T) {
 		{Timestamp: 3, Data: "hello foo"},
 	}
 
-	tokens := BuildTokenSet(ents)
+	tokens, truncated := BuildTokenSet(ents)
 	expectedTokens := []string{"bar", "foo", "hello", "world"}
 	require.Equal(t, expectedTokens, tokens)
+	require.False(t, truncated)
 
 	require.True(t, HasToken(tokens, "hello"))
 	require.True(t, HasToken(tokens, "world"))

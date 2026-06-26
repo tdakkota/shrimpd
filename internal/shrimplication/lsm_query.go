@@ -50,7 +50,7 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 	// Label terms use FST via LookupTokens in QueryMatcherWithStats.
 	result := make([]shrimptypes.Entry, 0)
 	for _, meta := range timeParts {
-		if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
+		if normalizedTerm != "" && !meta.TokensTruncated && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
 			stats.PartsPrunedByIndex++
 			stats.BlocksPrunedByIndex += meta.BlockCount
 			continue
@@ -148,7 +148,7 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
 		}
-		if normalizedTerm != "" && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
+		if normalizedTerm != "" && !meta.TokensTruncated && !shrimpblock.HasToken(meta.Tokens, normalizedTerm) {
 			stats.PartsPrunedByIndex++
 			stats.BlocksPrunedByIndex += meta.BlockCount
 			continue
@@ -274,7 +274,7 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 			return stats, ctx.Err()
 		}
 		// Fast token-set pre-filter (no I/O): check label name+value appear as tokens.
-		if len(m.Labels) > 0 {
+		if len(m.Labels) > 0 && !meta.TokensTruncated {
 			pruned := false
 			for _, lf := range m.Labels {
 				if lf.Op == shrimpfilter.OpLabelEq && !shrimpblock.HasToken(meta.Tokens, lf.Label+"="+lf.Value) {

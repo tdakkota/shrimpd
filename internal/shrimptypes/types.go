@@ -85,15 +85,16 @@ type SparseEntry struct {
 // It lives at /lsm/parts/{id} and acts as both the part registry and the global WAL
 // of committed parts (etcd revision gives total ordering across nodes).
 type PartMeta struct {
-	ID           string   `json:"id"`
-	NodeID       string   `json:"node_id"`
-	Level        int      `json:"level"` // 0 = freshly flushed, 1+ = compacted
-	MinTimestamp int64    `json:"min_timestamp"`
-	MaxTimestamp int64    `json:"max_timestamp"`
-	Count        int      `json:"count"`
-	Addr         string   `json:"addr"`             // host:port of the origin node's HTTP server
-	Tokens       []string `json:"tokens,omitempty"` // token set for text pruning
-	Compression  string   `json:"compression,omitempty"`
+	ID              string   `json:"id"`
+	NodeID          string   `json:"node_id"`
+	Level           int      `json:"level"` // 0 = freshly flushed, 1+ = compacted
+	MinTimestamp    int64    `json:"min_timestamp"`
+	MaxTimestamp    int64    `json:"max_timestamp"`
+	Count           int      `json:"count"`
+	Addr            string   `json:"addr"`                       // host:port of the origin node's HTTP server
+	Tokens          []string `json:"tokens,omitempty"`           // token set for text pruning
+	TokensTruncated bool     `json:"tokens_truncated,omitempty"` // true when Tokens hit the cap and cannot safely prune
+	Compression     string   `json:"compression,omitempty"`
 	// FormatVersion is 0 for legacy JSON parts, 1 for v2 binary parts.
 	FormatVersion int `json:"fmt,omitempty"`
 	BlockCount    int `json:"blocks,omitempty"`

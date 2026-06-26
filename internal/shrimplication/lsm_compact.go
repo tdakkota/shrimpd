@@ -100,6 +100,7 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		maxTS      int64
 		tokenSet   = make(map[string]struct{})
 		seenAnyRow bool
+		truncated  bool
 	)
 
 	oldIDs := make([]string, len(levelParts))
@@ -123,6 +124,13 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		count += len(block)
 		for _, e := range block {
 			for tok := range shrimpblock.Tokenize(e.Data) {
+				if _, ok := tokenSet[tok]; ok {
+					continue
+				}
+				if len(tokenSet) == shrimpblock.MaxTokenSetSize {
+					truncated = true
+					continue
+				}
 				tokenSet[tok] = struct{}{}
 			}
 		}
@@ -145,17 +153,18 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 	slices.Sort(tokens)
 
 	meta := shrimptypes.PartMeta{
-		ID:            id,
-		NodeID:        l.nodeID,
-		Level:         level + 1,
-		MinTimestamp:  minTS,
-		MaxTimestamp:  maxTS,
-		Count:         count,
-		Addr:          l.addr,
-		Tokens:        tokens,
-		Compression:   shrimpblock.CompressionZstd,
-		FormatVersion: 1,
-		BlockCount:    len(blockHeaders),
+		ID:              id,
+		NodeID:          l.nodeID,
+		Level:           level + 1,
+		MinTimestamp:    minTS,
+		MaxTimestamp:    maxTS,
+		Count:           count,
+		Addr:            l.addr,
+		Tokens:          tokens,
+		TokensTruncated: truncated,
+		Compression:     shrimpblock.CompressionZstd,
+		FormatVersion:   1,
+		BlockCount:      len(blockHeaders),
 	}
 
 	if err := WriteMeta(metaPath, meta); err != nil {
@@ -195,7 +204,9 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 	for i, tok := range tokens {
 		idxEntries[i] = shrimptypes.IndexEntry{Token: tok, DataID: meta.ID}
 	}
-	if err := l.idxEngine.Write(idxEntries); err != nil {
+	if truncated {
+		slog.WarnContext(ctx, "skipping truncated token index on compaction", "id", meta.ID)
+	} else if err := l.idxEngine.Write(idxEntries); err != nil {
 		slog.WarnContext(ctx, "failed to write index entries on compaction", "id", meta.ID, "error", err)
 	} else {
 		if err := l.idxEngine.MarkCovered([]string{meta.ID}); err != nil {
