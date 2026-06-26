@@ -18,11 +18,10 @@ import (
 
 const (
 	MagicShrimp = "SHMP"
-	v2Version   = 0x02
+	v2Version   = 0x03
 
-	v2HeaderSize  = 16   // 4 + 1 + 3 + 8
-	v2BlockDirRow = 1096 // per-block directory entry size
-	v2BlockRows   = 512  // default rows per block
+	v2HeaderSize = 16  // 4 + 1 + 3 + 8
+	v2BlockRows  = 512 // default rows per block
 
 	// DefaultV2BlockRows is the default streaming block size for callers outside
 	// this package.
@@ -101,17 +100,21 @@ func writePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSi
 		if err != nil {
 			return err
 		}
-		// Build a label-only bloom filter for this block.
-		// Text-token bloom is omitted: a fixed 8192-bit filter with k=4 saturates
-		// at ~10 k distinct tokens (FP ≈ 0.97) and prunes nothing on real log data.
-		// Label cardinality (lbl:k=v) is far lower so the bloom stays effective.
-		// Text-term pruning is handled at the part level via PartMeta.Tokens.
-		var bloom shrimptypes.BloomFilter
+		distinct := make(map[string]struct{})
 		for _, e := range block {
 			labels := shrimpfilter.ExtractLabels(e.Data)
 			for k, v := range labels {
-				BloomAddLabel(&bloom, k, v)
+				distinct["lbl:"+k+"="+v] = struct{}{}
 			}
+			for tok := range Tokenize(e.Data) {
+				distinct[tok] = struct{}{}
+			}
+		}
+		bloomBits := len(distinct) * 10
+		bloomBytes := max((bloomBits+7)/8, 1024)
+		bloom := make(shrimptypes.BloomFilter, bloomBytes)
+		for tok := range distinct {
+			bloomAddBytes(bloom, []byte(tok))
 		}
 		headers = append(headers, shrimptypes.BlockHeader{
 			Offset:       offset,
@@ -159,7 +162,10 @@ func writePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSi
 	}
 
 	dirOffset := int64(v2HeaderSize)
-	dirSize := int64(len(headers)) * v2BlockDirRow
+	var dirSize int64
+	for _, h := range headers {
+		dirSize += 40 + int64(len(h.Bloom))
+	}
 	if _, err := finalTmp.Write(make([]byte, dirSize)); err != nil {
 		return nil, fmt.Errorf("write dir placeholder: %w", err)
 	}
@@ -173,14 +179,17 @@ func writePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSi
 
 	dirBuf := make([]byte, dirSize)
 	baseOffset := dirOffset + dirSize
-	for bi, h := range headers {
-		row := dirBuf[bi*v2BlockDirRow : (bi+1)*v2BlockDirRow]
+	var offsetInDir int
+	for _, h := range headers {
+		row := dirBuf[offsetInDir : offsetInDir+40+len(h.Bloom)]
 		binary.LittleEndian.PutUint64(row[0:8], uint64(baseOffset+h.Offset))
 		binary.LittleEndian.PutUint64(row[8:16], uint64(h.CompressedSz))
 		binary.LittleEndian.PutUint32(row[16:20], uint32(h.Count))
 		binary.LittleEndian.PutUint64(row[20:28], uint64(h.MinTimestamp))
 		binary.LittleEndian.PutUint64(row[28:36], uint64(h.MaxTimestamp))
-		copy(row[36:1060], h.Bloom[:])
+		binary.LittleEndian.PutUint32(row[36:40], uint32(len(h.Bloom)))
+		copy(row[40:], h.Bloom)
+		offsetInDir += 40 + len(h.Bloom)
 	}
 	if _, err := finalTmp.WriteAt(dirBuf, dirOffset); err != nil {
 		return nil, fmt.Errorf("write dir: %w", err)
@@ -239,24 +248,27 @@ func OpenPartV2(path string, meta shrimptypes.PartMeta) (*PartFileV2, error) {
 	blockCount := int(binary.LittleEndian.Uint64(hdrBuf[8:16]))
 
 	// Read block directory
-	dirSize := blockCount * v2BlockDirRow
-	dirBuf := make([]byte, dirSize)
-	if _, err := io.ReadFull(br, dirBuf); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("read block dir: %w", err)
-	}
-
 	headers := make([]shrimptypes.BlockHeader, blockCount)
 	for bi := range blockCount {
-		row := dirBuf[bi*v2BlockDirRow : (bi+1)*v2BlockDirRow]
-		headers[bi] = shrimptypes.BlockHeader{
-			Offset:       int64(binary.LittleEndian.Uint64(row[0:8])),
-			CompressedSz: int64(binary.LittleEndian.Uint64(row[8:16])),
-			Count:        int32(binary.LittleEndian.Uint32(row[16:20])),
-			MinTimestamp: int64(binary.LittleEndian.Uint64(row[20:28])),
-			MaxTimestamp: int64(binary.LittleEndian.Uint64(row[28:36])),
+		var fixed [40]byte
+		if _, err := io.ReadFull(br, fixed[:]); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("read block dir fixed part: %w", err)
 		}
-		copy(headers[bi].Bloom[:], row[36:1060])
+		bloomLen := binary.LittleEndian.Uint32(fixed[36:40])
+		bloom := make(shrimptypes.BloomFilter, bloomLen)
+		if _, err := io.ReadFull(br, bloom); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("read block dir bloom: %w", err)
+		}
+		headers[bi] = shrimptypes.BlockHeader{
+			Offset:       int64(binary.LittleEndian.Uint64(fixed[0:8])),
+			CompressedSz: int64(binary.LittleEndian.Uint64(fixed[8:16])),
+			Count:        int32(binary.LittleEndian.Uint32(fixed[16:20])),
+			MinTimestamp: int64(binary.LittleEndian.Uint64(fixed[20:28])),
+			MaxTimestamp: int64(binary.LittleEndian.Uint64(fixed[28:36])),
+			Bloom:        bloom,
+		}
 	}
 
 	return &PartFileV2{

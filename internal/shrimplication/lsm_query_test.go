@@ -192,17 +192,17 @@ func TestQueryMatcherLabelBloomPruning(t *testing.T) {
 
 	// Blocks 0-1 have only svc-a: bloom must NOT contain svc-b label
 	for i := range 2 {
-		require.False(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-b"),
+		require.False(t, shrimpblock.BloomMightContainLabel(pf.Headers[i].Bloom, "service_name", "svc-b"),
 			"block %d has svc-a only, bloom should not contain svc-b label", i)
-		require.True(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-a"),
+		require.True(t, shrimpblock.BloomMightContainLabel(pf.Headers[i].Bloom, "service_name", "svc-a"),
 			"block %d has svc-a, bloom must contain svc-a label", i)
 	}
 
 	// Blocks 2-3 have only svc-b: bloom must NOT contain svc-a label
 	for _, i := range []int{2, 3} {
-		require.False(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-a"),
+		require.False(t, shrimpblock.BloomMightContainLabel(pf.Headers[i].Bloom, "service_name", "svc-a"),
 			"block %d has svc-b only, bloom should not contain svc-a label", i)
-		require.True(t, shrimpblock.BloomMightContainLabel(&pf.Headers[i].Bloom, "service_name", "svc-b"),
+		require.True(t, shrimpblock.BloomMightContainLabel(pf.Headers[i].Bloom, "service_name", "svc-b"),
 			"block %d has svc-b, bloom must contain svc-b label", i)
 	}
 }
