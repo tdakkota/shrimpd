@@ -8,7 +8,7 @@ require (
 	github.com/blevesearch/vellum v1.2.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
-	github.com/go-faster/sdk v0.35.0
+	github.com/go-faster/sdk v0.37.0
 	github.com/klauspost/compress v1.18.7
 	github.com/maypok86/otter v1.2.4
 	github.com/samber/slog-zap/v2 v2.7.0
@@ -27,7 +27,7 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
-	github.com/grafana/otel-profiling-go v0.5.3 // indirect
+	github.com/grafana/otel-profiling-go v0.6.0 // indirect
 	github.com/grafana/pyroscope-go v1.3.1 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.11 // indirect
 	github.com/moby/go-archive v0.2.0 // indirect
