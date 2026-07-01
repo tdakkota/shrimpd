@@ -9,7 +9,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-faster/sdk v0.37.0
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.19.0
 	github.com/maypok86/otter v1.2.4
 	github.com/samber/slog-zap/v2 v2.7.0
 	github.com/stretchr/testify v1.11.1
